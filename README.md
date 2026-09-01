@@ -3,10 +3,10 @@
 An LG webOS background service that keeps a Sonos soundbar's volume locked to the
 TV's own volume, and draws a matching on-screen volume indicator.
 
-When a TV is set to `external_arc` sound output, webOS suppresses its own volume
+Problem: When a TV is set to `external_arc` sound output, webOS suppresses its own volume
 OSD and hands control to HDMI-CEC. The remote still changes the volume, but there
-is no number on screen and the two devices drift apart over time. This project
-restores the indicator and keeps the two scales in agreement.
+is no number on screen and the two devices drift apart over time. **This project
+restores the indicator and keeps the two scales in agreement.**
 
 ## Key features
 
