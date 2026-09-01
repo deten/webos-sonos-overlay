@@ -35,24 +35,59 @@ restores the indicator and keeps the two scales in agreement.**
 
 ## Installing
 
-No PC and no ssh required. The app is published as a Homebrew Channel repository,
-so it installs on the TV like any other homebrew app.
+The TV must already be rooted with Homebrew Channel installed. Either method
+below gives you the same package: the service, the overlay, and the setup app.
 
-1. On the TV, open **Homebrew Channel**, go to **Settings**, and choose
-   **Add repository**.
-2. Enter:
+### Option A: add the repository (no PC needed)
+
+Recommended. Homebrew Channel then handles updates for you.
+
+1. On the TV, open **Homebrew Channel** and go to **Settings**.
+2. Choose **Add repository** and enter:
 
    ```
    https://raw.githubusercontent.com/deten/webos-sonos-overlay/main/repo/
    ```
 
-3. Go back to the app list. **Sonos Volume Overlay** appears. Install it.
+3. Return to the app list. **Sonos Volume Overlay** appears there. Install it.
 4. Launch it once. It finds your Sonos, tests the connection, and offers to
    install the boot hook so it starts automatically from then on.
 
-Homebrew Channel must already be installed, since the TV has to be rooted for any
-of this to work. Nothing else is needed: the package carries the service, the
-overlay, and the setup app.
+When a new version is published, Homebrew Channel shows it as an update in the
+same list.
+
+### Option B: install the ipk directly
+
+Use this if you would rather not add a repository. Homebrew Channel has no
+"install from file" option, so this needs a computer. Updates are manual: repeat
+these steps for each new version.
+
+Download the latest `.ipk` from the
+[Releases page](https://github.com/deten/webos-sonos-overlay/releases), then use
+whichever of these you already have.
+
+**webOS Dev Manager** (graphical, easiest)
+
+Add your TV in the app, then use *Install app* and pick the downloaded `.ipk`.
+
+**ares-install** (from the official webOS TV SDK)
+
+```
+ares-setup-device            # once, to register the TV
+ares-install --device <name> com.brineandbuild.sonosoverlay_<version>_all.ipk
+```
+
+**ssh** (if you already have shell access to the TV)
+
+```
+scp com.brineandbuild.sonosoverlay_<version>_all.ipk root@<tv-ip>:/tmp/app.ipk
+ssh root@<tv-ip> "luna-send -n 50 luna://com.webos.appInstallService/dev/install '{\"id\":\"com.brineandbuild.sonosoverlay\",\"ipkUrl\":\"/tmp/app.ipk\",\"subscribe\":true}'"
+```
+
+If you have this repository checked out, `npm run deploy-ipk` does the same thing
+using the settings in `deploy.config.json`.
+
+Whichever method you use, launch the app once afterwards to run setup.
 
 ## Requirements
 
