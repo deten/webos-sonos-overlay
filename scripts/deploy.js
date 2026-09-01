@@ -101,6 +101,32 @@ var commands = {
     ssh(cfg, 'fuser -k 7474/tcp 2>/dev/null; sleep 1; node /home/root/tv-service.js');
   },
 
+  // Both logs at once. The runtime log lives in a ramfs and is lost on reboot;
+  // the diagnostics log is on persistent storage and survives one.
+  'logs': function (cfg) {
+    var follow = process.argv.indexOf('--follow') !== -1 ||
+                 process.argv.indexOf('-f') !== -1;
+    if (follow) {
+      ssh(cfg, 'tail -f /var/log/sonos-overlay.log');
+      return;
+    }
+    ssh(cfg,
+      'echo "===== /var/log/sonos-overlay.log (runtime, lost on reboot) ====="; ' +
+      'tail -80 /var/log/sonos-overlay.log 2>/dev/null; ' +
+      'echo; echo "===== diagnostics.log (persistent) ====="; ' +
+      'tail -40 /var/lib/com.brineandbuild.sonosoverlay/diagnostics.log 2>/dev/null');
+  },
+
+  'fetch-logs': function (cfg) {
+    var args = sshArgs(cfg).concat([
+      cfg.tvUser + '@' + cfg.tvIp + ':/var/log/sonos-overlay.log',
+      cfg.tvUser + '@' + cfg.tvIp + ':/var/lib/com.brineandbuild.sonosoverlay/diagnostics.log',
+      '.'
+    ]);
+    run('scp', args);
+    console.log('Copied sonos-overlay.log and diagnostics.log into the current directory.');
+  },
+
   'launch': function (cfg) {
     var payload = JSON.stringify({ id: cfg.appId });
     ssh(cfg,

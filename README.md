@@ -194,6 +194,28 @@ On startup the service identifies the platform and probes each of these, then lo
 one line saying whether this release is tested. On an untested release the Setup app
 shows an advisory banner and setup continues normally.
 
+## Reading the logs
+
+With this repository checked out and `deploy.config.json` filled in:
+
+```
+npm run logs                 # last 80 runtime lines plus the persistent log
+npm run logs -- --follow     # follow the runtime log live
+npm run fetch-logs           # copy both logs into the current directory
+```
+
+Or over ssh directly:
+
+```
+ssh root@<tv-ip> "tail -50 /var/log/sonos-overlay.log"
+ssh root@<tv-ip> "tail -f /var/log/sonos-overlay.log"
+```
+
+There are two logs. `/var/log/sonos-overlay.log` is the full runtime log and is
+lost on every reboot, because that path is a ramfs.
+`/var/lib/com.brineandbuild.sonosoverlay/diagnostics.log` holds only notable
+events, survives a reboot, and is capped in size.
+
 ## Reporting a problem
 
 The service keeps a diagnostics log at

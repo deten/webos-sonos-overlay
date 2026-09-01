@@ -13,6 +13,8 @@
     "deploy": "node scripts/deploy.js service",
     "deploy-ipk": "node scripts/deploy.js ipk",
     "run-tv": "node scripts/deploy.js run",
+    "logs": "node scripts/deploy.js logs",
+    "fetch-logs": "node scripts/deploy.js fetch-logs",
     "launch-overlay": "node scripts/deploy.js launch"
   },
   "dependencies": {
