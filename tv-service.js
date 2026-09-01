@@ -141,6 +141,15 @@ function maskIps(text) {
     function (m, a, b) { return a + '.' + b + '.x.x'; });
 }
 
+function refreshPlatform() {
+  if (state.platform && !compatLib.isIncomplete(state.platform)) return;
+  var fresh = compatLib.readPlatform();
+  if (!compatLib.isIncomplete(fresh) || !state.platform) {
+    state.platform = fresh;
+    state.compat   = compatLib.checkPlatform(fresh);
+  }
+}
+
 function buildDiagnosticsReport() {
   var L = [];
   var p = state.platform || {};
@@ -318,7 +327,11 @@ function startApiServer() {
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       res.setHeader('Content-Disposition',
         'attachment; filename="sonos-overlay-diagnostics.txt"');
-      res.end(buildDiagnosticsReport());
+      refreshPlatform();
+      // Re-probe so the report describes the TV now, not at startup.
+      runProbes(function() {
+        res.end(buildDiagnosticsReport());
+      });
       return;
     }
 
@@ -932,7 +945,7 @@ function pad6(n)   { var s = String(n); while (s.length < 6) s = '0' + s; return
 // Reports what the platform supports. Advisory only, nothing here stops the
 // service, because a partial failure (say, no overlay) still leaves volume sync
 // working, and the user is better served by a running service and a clear log.
-function runStartupProbes() {
+function runProbes(cb) {
   var extra = [];
 
   // Devices are opened speculatively, only one carries the remote's volume
@@ -960,6 +973,7 @@ function runStartupProbes() {
 
   compatLib.runProbes(extra, function (results) {
     state.probes = results;
+    if (cb) { cb(results); return; }
     var failed = results.filter(function (r) { return !r.ok; });
     results.forEach(function (r) {
       state.diag.write(r.ok ? 'info' : 'warn',
@@ -1015,7 +1029,7 @@ async function main() {
   }
 
   startPeriodicSync();
-  runStartupProbes();
+  runProbes(null);
 
   process.on('SIGINT',  shutdown);
   process.on('SIGTERM', shutdown);

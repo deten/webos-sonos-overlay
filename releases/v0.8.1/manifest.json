@@ -1,0 +1,20 @@
+{
+  "version": "0.8.1",
+  "built": "2026-09-01T18:50:24.774Z",
+  "git": {
+    "commit": "6ac980d",
+    "dirty": true
+  },
+  "files": [
+    {
+      "name": "com.brineandbuild.sonosoverlay.ipk",
+      "bytes": 134722,
+      "sha256": "fd3f26f680072da910dc0cea3719d61616f982a3cfd4346d4ba06d59ad2f6954"
+    },
+    {
+      "name": "tv-service.bundle.js",
+      "bytes": 549745,
+      "sha256": "9b3c054216ed27989fa40ac0ef39b4ff3c8b27b92f244a847cf3bf4e362536f7"
+    }
+  ]
+}
