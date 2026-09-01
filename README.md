@@ -22,7 +22,7 @@ restores the indicator and keeps the two scales in agreement.**
 - **Absolute volume ceiling** plus a per-correction raise cap, so no single
   correction can produce a large jump.
 - **Setup app** for discovering the player, testing it, and installing the
-  boot-time hook — no manual config editing.
+  boot-time hook, no manual config editing.
 - **Survives cold boot.** The TV fully cold-boots on every power-on; the service
   retries with backoff through Wi-Fi association and DHCP.
 
@@ -78,7 +78,7 @@ npm run launch-overlay  # start the overlay app
 
 ## Releases
 
-`npm run release` snapshots the current build into `releases/v<version>/` —
+`npm run release` snapshots the current build into `releases/v<version>/`:
 the service bundle, the `.ipk`, a manifest with a SHA-256 per file, and a notes
 file. Bump `version` in `package.json` first; the script will not overwrite an
 existing folder without `--force`.
@@ -88,9 +88,19 @@ ones can be deleted whenever they stop being useful. See `releases/README.md`.
 
 ## Compatibility
 
-Tested on **webOS 6.4.0** (LG C1, `OLED65C1PUB`, TV-side Node v8.12.0). Nothing is
-version-locked — the service runs on any release and reports what it finds rather
-than refusing to start.
+Nothing is version-locked. The service runs on any release and reports what it
+finds rather than refusing to start.
+
+### Tested devices
+
+| TV model | webOS | TV Node | Status |
+|---|---|---|---|
+| `OLED65C1PUB` (LG C1) | 6.4.0 | v8.12.0 | Working. Overlay, volume sync, and cold-boot survival all confirmed. |
+
+If your TV is not listed, it is not known to fail, only unverified. Send a
+diagnostics report (see below) and it will be added to this table. The report's
+`DEVICE:` line carries everything needed: model, webOS release, and TV Node
+version.
 
 Several things it depends on are internal to webOS and can move between releases:
 
@@ -117,9 +127,10 @@ To send it:
 
 1. On the TV, open the Sonos Overlay app and choose **Diagnostics** on the last screen.
 2. It shows an address like `http://<tv-ip>:7476/api/diagnostics`. Open that in a
-   browser on your phone or computer, on the same network — it downloads a text file.
-3. Attach that file to a new issue on this repository, and say what you expected to
-   happen and what happened instead.
+   browser on your phone or computer, on the same network; it downloads a text file.
+3. Attach that file to a new issue on this repository. Say what you expected to
+   happen and what happened instead, or just say it works if you are reporting a
+   TV that is not in the table yet.
 
 The report contains the webOS version, TV model, the result of each dependency probe,
 current volume state, and the service's event log. **Network addresses are masked**
@@ -141,5 +152,5 @@ Written by the setup app to `/var/lib/com.brineandbuild.sonosoverlay/config.json
   quiet; a retry loop can consume real memory.
 - Input device numbering shifts between boots, so a configured device that no
   longer exists is normal. The reader abandons a device that never emits.
-- Never measure the TV's native volume step while anything is writing to the TV —
+- Never measure the TV's native volume step while anything is writing to the TV;
   the writes read back as the step.

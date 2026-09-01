@@ -4512,7 +4512,7 @@ var require_input = __commonJS({
           return;
         }
         fd = openedFd;
-        console.log("[input] opened", devicePath, "(fd=" + fd + ") \u2014 waiting for key events...");
+        console.log("[input] opened", devicePath, "(fd=" + fd + "), waiting for key events...");
         readNext();
       });
       function readNext() {
@@ -4572,6 +4572,7 @@ var require_input = __commonJS({
       var child = null;
       var restarts = 0;
       var everEmitted = false;
+      var handle = null;
       var MAX_DEAD_RESTARTS = 5;
       function onData(chunk) {
         var recvAt = process.hrtime();
@@ -4617,7 +4618,7 @@ var require_input = __commonJS({
               console.warn(
                 "[input] giving up on",
                 devicePath,
-                "\u2014 never produced an event in",
+                ", never produced an event in",
                 restarts,
                 "attempts"
               );
@@ -4630,7 +4631,7 @@ var require_input = __commonJS({
             devicePath,
             "exited with code",
             code,
-            "\u2014 restarting in",
+            ", restarting in",
             delay2 + "ms (restart #" + restarts + ")"
           );
           setTimeout(function() {
@@ -4644,7 +4645,14 @@ var require_input = __commonJS({
         closed = true;
         if (child) child.kill();
       }
-      return { close };
+      handle = {
+        path: devicePath,
+        close,
+        isLive: function() {
+          return everEmitted;
+        }
+      };
+      return handle;
     }
     function openInputDevicesMulti2(devicePaths, onEvent, onError) {
       var handles = [];
@@ -4658,6 +4666,15 @@ var require_input = __commonJS({
         handles.push(handle);
       });
       return {
+        devices: devicePaths.slice(),
+        // Devices that have actually produced an event, not merely opened.
+        live: function() {
+          return handles.filter(function(h) {
+            return h.isLive && h.isLive();
+          }).map(function(h) {
+            return h.path;
+          });
+        },
         close: function() {
           handles.forEach(function(h) {
             h.close();
@@ -4707,7 +4724,7 @@ var require_correlator = __commonJS({
         }
       }
       if (matchIdx === -1) {
-        console.log("[corr] GENA vol=" + vol + " dir=" + direction + " | no matching keypress \u2014 external or catch-up");
+        console.log("[corr] GENA vol=" + vol + " dir=" + direction + " | no matching keypress, external or catch-up");
         return;
       }
       var key = this.pendingKeys.splice(matchIdx, 1)[0];
@@ -4740,7 +4757,7 @@ var require_correlator = __commonJS({
         if (ageMs <= windowMs) {
           remaining.push(this.pendingKeys[i]);
         } else {
-          console.warn("[corr] dropping unmatched keypress dir=" + this.pendingKeys[i].direction + " age=" + ageMs.toFixed(0) + "ms \u2014 no GENA event arrived");
+          console.warn("[corr] dropping unmatched keypress dir=" + this.pendingKeys[i].direction + " age=" + ageMs.toFixed(0) + "ms, no GENA event arrived");
         }
       }
       this.pendingKeys = remaining;
@@ -4750,6 +4767,328 @@ var require_correlator = __commonJS({
       return ns / 1e6;
     }
     module2.exports = { Correlator: Correlator2 };
+  }
+});
+
+// lib/compat.js
+var require_compat = __commonJS({
+  "lib/compat.js"(exports2, module2) {
+    "use strict";
+    var fs2 = require("fs");
+    var cp2 = require("child_process");
+    var TESTED = [
+      { release: "6.4.0", model: "OLED65C1PUB", note: "LG C1, development device" }
+    ];
+    var KNOWN_RISKS = {
+      "3": "Node on the TV predates this bundle\u2019s target; the service may not start.",
+      "4": "The compositor volume QML has a different layout; the overlay patch may not apply.",
+      "5": "The compositor volume QML has a different layout; the overlay patch may not apply.",
+      "7": "Untested. The audio Luna service and QML paths may have moved.",
+      "8": "Untested. The audio Luna service and QML paths may have moved.",
+      "9": "Untested. The audio Luna service and QML paths may have moved."
+    };
+    var QML_PATH = "/usr/lib/qml/WebOSCompositor/views/volume/StarfishVolume.qml";
+    var HOOK_PATH = "/var/lib/webosbrew/init.d/sonos-overlay";
+    function readPlatform() {
+      var info = {
+        release: null,
+        model: null,
+        board: null,
+        name: null,
+        node: process.version,
+        source: null
+      };
+      try {
+        var os2 = JSON.parse(fs2.readFileSync("/var/run/nyx/os_info.json", "utf8"));
+        info.release = os2.webos_release || os2.core_os_release || null;
+        info.name = os2.webos_name || null;
+        if (info.release) info.source = "nyx/os_info.json";
+      } catch (e) {
+      }
+      if (!info.release) {
+        try {
+          var rel = fs2.readFileSync("/etc/starfish-release", "utf8");
+          var m = rel.match(/(\d+\.\d+\.\d+)/);
+          if (m) {
+            info.release = m[1];
+            info.source = "starfish-release";
+          }
+        } catch (e) {
+        }
+      }
+      if (!info.release) {
+        try {
+          var cmd = '/usr/bin/luna-send -n 1 -f luna://com.webos.service.systemservice/osInfo \'{"parameters":["webos_release"]}\' 2>/dev/null';
+          var j = JSON.parse(cp2.execSync(cmd, { timeout: 4e3 }).toString());
+          if (j.webos_release) {
+            info.release = j.webos_release;
+            info.source = "systemservice/osInfo";
+          }
+        } catch (e) {
+        }
+      }
+      try {
+        var dev = JSON.parse(fs2.readFileSync("/var/run/nyx/device_info.json", "utf8"));
+        info.model = dev.product_id || dev.model_name || null;
+        info.board = dev.board_type || null;
+      } catch (e) {
+      }
+      return info;
+    }
+    function majorOf(release) {
+      if (!release) return null;
+      var m = String(release).match(/^(\d+)/);
+      return m ? m[1] : null;
+    }
+    function checkPlatform(info) {
+      if (!info.release) {
+        return {
+          status: "unknown",
+          message: "Could not determine the webOS version. The service will still run."
+        };
+      }
+      var exact = TESTED.filter(function(t) {
+        return t.release === info.release;
+      })[0];
+      if (exact) {
+        var msg = "webOS " + info.release + " is a tested version";
+        if (exact.model && info.model && exact.model !== info.model) {
+          msg += " (tested on " + exact.model + ", this is a " + info.model + "; the firmware is what matters, so this should be fine)";
+        }
+        return { status: "tested", message: msg + "." };
+      }
+      var sameMajor = TESTED.filter(function(t) {
+        return majorOf(t.release) === majorOf(info.release);
+      })[0];
+      var msg = "webOS " + info.release + " has not been tested with this build";
+      if (sameMajor) {
+        msg += " (webOS " + sameMajor.release + " has been, so it will probably work)";
+      }
+      msg += ".";
+      var risk = KNOWN_RISKS[majorOf(info.release)];
+      if (risk) msg += " " + risk;
+      return {
+        status: "untested",
+        message: msg,
+        testedOn: TESTED.map(function(t) {
+          return t.release;
+        })
+      };
+    }
+    function probeNode() {
+      var major = parseInt(String(process.version).replace(/^v/, "").split(".")[0], 10);
+      var ok = !isNaN(major) && major >= 8;
+      return {
+        name: "node",
+        ok,
+        detail: "TV Node " + process.version + (ok ? "" : " (older than the build target, node8)")
+      };
+    }
+    function probeQml() {
+      var mounted = false;
+      try {
+        mounted = fs2.readFileSync("/proc/mounts", "utf8").indexOf("StarfishVolume.qml") !== -1;
+      } catch (e) {
+      }
+      if (!fs2.existsSync(QML_PATH)) {
+        return {
+          name: "overlay-qml",
+          ok: false,
+          detail: "Compositor volume QML not found at the expected path. The on-screen indicator will not appear on this webOS version."
+        };
+      }
+      var hasMarker = false;
+      try {
+        hasMarker = fs2.readFileSync(QML_PATH, "utf8").indexOf("external_arc") !== -1;
+      } catch (e) {
+      }
+      if (!hasMarker && !mounted) {
+        return {
+          name: "overlay-qml",
+          ok: false,
+          detail: "Volume QML found, but it has no external_arc guard to remove. The patch does not apply to this version."
+        };
+      }
+      return {
+        name: "overlay-qml",
+        ok: true,
+        detail: mounted ? "patch applied (bind mount active)" : "patchable; mount not yet applied"
+      };
+    }
+    function probeHook() {
+      var ok = fs2.existsSync(HOOK_PATH);
+      return {
+        name: "boot-hook",
+        ok,
+        detail: ok ? "installed" : "not installed. The overlay will not survive a power cycle"
+      };
+    }
+    function probeIptables() {
+      var ok = fs2.existsSync("/usr/sbin/iptables") || fs2.existsSync("/sbin/iptables");
+      return {
+        name: "iptables",
+        ok,
+        detail: ok ? "present" : "not found. Ports may stay closed to the overlay and setup app"
+      };
+    }
+    function probeAudioService(cb) {
+      var cmd = "/usr/bin/luna-send -n 1 -f luna://com.webos.service.audio/master/getVolume '{}' 2>/dev/null";
+      cp2.exec(cmd, { timeout: 5e3 }, function(err, stdout) {
+        if (err || !stdout) {
+          cb({
+            name: "luna-audio",
+            ok: false,
+            detail: "com.webos.service.audio did not respond. The TV volume cannot be read or written on this version, so sync will not work."
+          });
+          return;
+        }
+        var vol = null;
+        try {
+          var j = JSON.parse(stdout);
+          vol = j.volumeStatus && typeof j.volumeStatus.volume === "number" ? j.volumeStatus.volume : typeof j.volume === "number" ? j.volume : null;
+        } catch (e) {
+        }
+        if (vol === null) {
+          cb({
+            name: "luna-audio",
+            ok: false,
+            detail: "Audio service responded in an unexpected shape: " + String(stdout).replace(/\s+/g, " ").slice(0, 200)
+          });
+          return;
+        }
+        cb({ name: "luna-audio", ok: true, detail: "TV volume reads as " + vol });
+      });
+    }
+    function runProbes(extra, cb) {
+      var results = [probeNode(), probeQml(), probeHook(), probeIptables()];
+      if (extra && extra.length) results = results.concat(extra);
+      probeAudioService(function(audio) {
+        results.push(audio);
+        cb(results);
+      });
+    }
+    module2.exports = {
+      TESTED,
+      QML_PATH,
+      readPlatform,
+      checkPlatform,
+      runProbes
+    };
+  }
+});
+
+// lib/diaglog.js
+var require_diaglog = __commonJS({
+  "lib/diaglog.js"(exports2, module2) {
+    "use strict";
+    var fs2 = require("fs");
+    var path2 = require("path");
+    var MAX_BYTES = 96 * 1024;
+    var KEEP_BYTES = 48 * 1024;
+    function DiagLog(filePath) {
+      this.path = filePath;
+      this.dir = path2.dirname(filePath);
+      this.ready = false;
+      this.pending = [];
+      this.init();
+    }
+    DiagLog.prototype.init = function() {
+      try {
+        if (!fs2.existsSync(this.dir)) fs2.mkdirSync(this.dir, { recursive: true });
+        this.ready = true;
+      } catch (e) {
+        this.ready = false;
+      }
+    };
+    DiagLog.prototype.trimIfNeeded = function() {
+      try {
+        if (!fs2.existsSync(this.path)) return;
+        if (fs2.statSync(this.path).size <= MAX_BYTES) return;
+        var buf = fs2.readFileSync(this.path);
+        var tail = buf.slice(buf.length - KEEP_BYTES).toString("utf8");
+        var nl = tail.indexOf("\n");
+        if (nl !== -1) tail = tail.slice(nl + 1);
+        fs2.writeFileSync(
+          this.path,
+          "--- earlier entries trimmed ---\n" + tail,
+          "utf8"
+        );
+      } catch (e) {
+      }
+    };
+    DiagLog.prototype.write = function(level, message) {
+      var line = (/* @__PURE__ */ new Date()).toISOString() + "  " + (level.toUpperCase() + "   ").slice(0, 5) + "  " + message + "\n";
+      this.pending.push(line);
+      if (this.pending.length > 200) this.pending.shift();
+      if (!this.ready) return;
+      try {
+        fs2.appendFileSync(this.path, line, "utf8");
+        this.trimIfNeeded();
+      } catch (e) {
+      }
+    };
+    DiagLog.prototype.info = function(m) {
+      this.write("info", m);
+    };
+    DiagLog.prototype.warn = function(m) {
+      this.write("warn", m);
+    };
+    DiagLog.prototype.error = function(m) {
+      this.write("error", m);
+    };
+    DiagLog.prototype.change = function(key, value, message) {
+      if (!this._last) this._last = {};
+      if (this._last[key] === value) return;
+      this._last[key] = value;
+      this.write("info", message);
+    };
+    DiagLog.prototype.read = function() {
+      try {
+        return fs2.readFileSync(this.path, "utf8");
+      } catch (e) {
+        return this.pending.join("");
+      }
+    };
+    DiagLog.prototype.clear = function() {
+      this.pending = [];
+      this._last = {};
+      try {
+        fs2.unlinkSync(this.path);
+      } catch (e) {
+      }
+    };
+    module2.exports = { DiagLog };
+  }
+});
+
+// package.json
+var require_package = __commonJS({
+  "package.json"(exports2, module2) {
+    module2.exports = {
+      name: "webos-sonos-overlay",
+      version: "0.7.0",
+      description: "Sonos volume sync and on-screen volume indicator for webOS LG TVs",
+      main: "index.js",
+      scripts: {
+        start: "node index.js",
+        "build:tv": "esbuild tv-service.js --bundle --platform=node --target=node8 --external:bufferutil --external:utf-8-validate --outfile=dist/tv-service.bundle.js",
+        "build-ipk": "npm run build:tv && node scripts/build-ipk.js",
+        release: "node scripts/release.js",
+        "open-ports": "node scripts/deploy.js open-ports",
+        deploy: "node scripts/deploy.js service",
+        "deploy-ipk": "node scripts/deploy.js ipk",
+        "run-tv": "node scripts/deploy.js run",
+        "launch-overlay": "node scripts/deploy.js launch"
+      },
+      dependencies: {
+        "fast-xml-parser": "^5.7.2",
+        "node-ssdp": "^4.0.1",
+        ws: "^6.2.3"
+      },
+      devDependencies: {
+        esbuild: "^0.25.0"
+      }
+    };
   }
 });
 
@@ -7636,7 +7975,7 @@ var require_const = __commonJS({
 });
 
 // node_modules/node-ssdp/package.json
-var require_package = __commonJS({
+var require_package2 = __commonJS({
   "node_modules/node-ssdp/package.json"(exports2, module2) {
     module2.exports = {
       name: "node-ssdp",
@@ -7708,8 +8047,8 @@ var require_lib = __commonJS({
     var ssdpHeader = /^([^:]+):\s*(.*)$/;
     var c = require_const();
     var nodeVersion = process.version.substr(1);
-    var moduleVersion = require_package().version;
-    var moduleName = require_package().name;
+    var moduleVersion = require_package2().version;
+    var moduleName = require_package2().name;
     function SSDP(opts) {
       var self2 = this;
       if (!(this instanceof SSDP)) return new SSDP(opts);
@@ -13447,6 +13786,9 @@ var soapLib = require_soap();
 var parseLib = require_parse();
 var inputLib = require_input();
 var corrLib = require_correlator();
+var compatLib = require_compat();
+var diagLib = require_diaglog();
+var pkg = require_package();
 var startListener = genaLib.startListener;
 var subscribe = genaLib.subscribe;
 var renew = genaLib.renew;
@@ -13467,6 +13809,7 @@ var DEFAULT_WS_PORT = 7475;
 var API_PORT = 7476;
 var CONFIG_DIR = "/var/lib/com.brineandbuild.sonosoverlay";
 var CONFIG_FILE = CONFIG_DIR + "/config.json";
+var DIAG_FILE = CONFIG_DIR + "/diagnostics.log";
 var RETRY_BASE_MS = 3e3;
 var RETRY_MAX_MS = 6e4;
 var SYNC_INTERVAL_MS = 1e4;
@@ -13491,8 +13834,16 @@ var state = {
   lastKeyAt: 0,
   genaReceived: false,
   connecting: false,
+  platform: null,
+  // webOS release / model, read once at startup
+  compat: null,
+  // tested | untested | unknown
+  probes: [],
+  // dependency probe results
+  diag: null,
+  // persistent diagnostics log
   tvVol: null,
-  // last value read from the TV — the source of truth
+  // last value read from the TV, the source of truth
   sonosVol: null,
   // last value the Arc reported, via GENA or SOAP
   pendingSonosWrite: null,
@@ -13503,6 +13854,64 @@ var state = {
   transportState: null,
   holding: false
 };
+function maskIps(text) {
+  return String(text).replace(
+    /\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g,
+    function(m, a, b) {
+      return a + "." + b + ".x.x";
+    }
+  );
+}
+function buildDiagnosticsReport() {
+  var L = [];
+  var p = state.platform || {};
+  var c = state.compat || {};
+  L.push("Sonos Overlay diagnostics");
+  L.push("=========================");
+  L.push("generated:   " + (/* @__PURE__ */ new Date()).toISOString());
+  L.push("app version: " + pkg.version);
+  L.push("");
+  L.push("DEVICE: " + (p.model || "unknown model") + " / webOS " + (p.release || "unknown") + " / node " + (p.node || "unknown") + " / " + (c.status || "unknown"));
+  L.push("");
+  L.push("Platform");
+  L.push("--------");
+  L.push("webOS release: " + (p.release || "unknown") + (p.source ? "  (via " + p.source + ")" : ""));
+  L.push("model:         " + (p.model || "unknown") + (p.board ? "  [" + p.board + "]" : ""));
+  L.push("TV node:       " + (p.node || "unknown"));
+  L.push("compatibility: " + (c.status || "unknown").toUpperCase());
+  L.push("               " + (c.message || ""));
+  if (c.status === "untested" && c.testedOn) {
+    L.push("               tested releases: " + c.testedOn.join(", "));
+  }
+  L.push("");
+  L.push("Dependency checks");
+  L.push("-----------------");
+  if (!state.probes.length) {
+    L.push("(not yet run)");
+  } else {
+    state.probes.forEach(function(r) {
+      L.push((r.ok ? "[ ok ] " : "[FAIL] ") + (r.name + "            ").slice(0, 13) + " " + r.detail);
+    });
+  }
+  L.push("");
+  L.push("Runtime state");
+  L.push("-------------");
+  L.push("configured:     " + !!state.config);
+  L.push("sonos model:    " + (state.config && state.config.sonosModel || "n/a"));
+  L.push("subscribed:     " + !!state.sid);
+  L.push("gena received:  " + state.genaReceived);
+  L.push("overlay clients:" + (state.wss ? state.wss.clients.size : 0));
+  L.push("TV volume:      " + state.tvVol);
+  L.push("Sonos volume:   " + state.sonosVol + "   (expected " + (state.tvVol === null ? "n/a" : tvToSonos(state.tvVol)) + ")");
+  L.push("ceiling:        " + state.maxVolume + " Sonos / " + maxTvVol() + " TV");
+  L.push("transport:      " + state.transportState);
+  L.push("last key:       " + (state.lastKeyAt ? Math.round((Date.now() - state.lastKeyAt) / 1e3) + "s ago" : "none"));
+  L.push("");
+  L.push("Event log");
+  L.push("---------");
+  L.push(state.diag ? state.diag.read() || "(empty)" : "(unavailable)");
+  return maskIps(L.join("\n"));
+}
 function readConfig() {
   try {
     return JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
@@ -13595,8 +14004,26 @@ function startApiServer() {
         lastMuted: state.correlator ? state.correlator.lastMuted : null,
         wsClients: state.wss ? state.wss.clients.size : 0,
         lastKeyAt: state.lastKeyAt,
-        genaReceived: state.genaReceived
+        genaReceived: state.genaReceived,
+        platform: state.platform,
+        compat: state.compat,
+        probes: state.probes,
+        tvIp: detectLanIp()
       }));
+      return;
+    }
+    if (url === "/api/diagnostics" && req.method === "GET") {
+      res.setHeader("Content-Type", "text/plain; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        'attachment; filename="sonos-overlay-diagnostics.txt"'
+      );
+      res.end(buildDiagnosticsReport());
+      return;
+    }
+    if (url === "/api/diagnostics" && req.method === "DELETE") {
+      if (state.diag) state.diag.clear();
+      res.end(JSON.stringify({ ok: true }));
       return;
     }
     if (url === "/api/scan" && req.method === "GET") {
@@ -13690,6 +14117,9 @@ async function resolveDevice(config) {
       return { ip: config.sonosIp, port };
     } catch (e) {
       console.warn("[resolve] stored IP", config.sonosIp, "unreachable:", e.message);
+      if (state.diag) {
+        state.diag.info("stored Sonos IP unreachable (" + e.message + "), falling back to discovery");
+      }
     }
   }
   console.log("[resolve] scanning for the configured player...");
@@ -13710,7 +14140,7 @@ async function resolveDevice(config) {
       match = byName[0];
       console.log("[resolve] matched name+model at", match.ip);
     } else if (byName.length > 1) {
-      console.warn("[resolve]", byName.length, 'players share room "' + config.sonosName + '" \u2014 cannot disambiguate without a stored UUID');
+      console.warn("[resolve]", byName.length, 'players share room "' + config.sonosName + '", cannot disambiguate without a stored UUID');
     }
   }
   if (!match) throw new Error("could not identify the configured Sonos among " + devices.length + " device(s)");
@@ -13796,11 +14226,19 @@ async function connectToSonos(config, attempt) {
       console.log("[input] listening on", devPaths.length, "device(s):", devPaths.join(", "));
       state.inputHandle = openInputDevicesMulti(devPaths, onInputEvent, function(err) {
         console.error("[input] fatal:", err.message);
+        if (state.diag) state.diag.error("input reader fatal: " + err.message);
       });
     }
-    console.log("\n[main] ready \u2014 press Vol+/Vol\u2212/Mute on the remote.\n");
+    console.log("\n[main] ready, press Vol+/Vol\u2212/Mute on the remote.\n");
   } catch (e) {
     console.error("[main] connect failed (attempt " + (attempt + 1) + "):", e.message);
+    if (state.diag) {
+      state.diag.change(
+        "connect-fail",
+        e.message,
+        "connect to Sonos failed: " + e.message
+      );
+    }
     var delayMs = Math.min(RETRY_BASE_MS * Math.pow(2, attempt), RETRY_MAX_MS);
     console.log("[main] retrying in", Math.round(delayMs / 1e3) + "s");
     state.retryTimer = setTimeout(function() {
@@ -13877,7 +14315,7 @@ function reconcileTvAndSonos() {
       console.warn(
         "[cap] TV at",
         tvVol,
-        "\u2014 holding at TV ceiling",
+        ", holding at TV ceiling",
         tvCap,
         "(Sonos " + state.maxVolume + ")"
       );
@@ -13905,6 +14343,9 @@ function reconcileTvAndSonos() {
       setSonosVolume(state.device, target).catch(function(e) {
         state.pendingSonosWrite = null;
         console.error("[settle] SetVolume failed:", e.message);
+        if (state.diag) {
+          state.diag.change("setvol-fail", e.message, "SetVolume failed: " + e.message);
+        }
       });
     }).catch(function() {
     });
@@ -13927,7 +14368,7 @@ function reconcile(genaVol, genaMuted) {
       prev,
       "->",
       genaVol,
-      "with no keypress \u2014 adopting into TV as",
+      "with no keypress, adopting into TV as",
       adopted
     );
     state.tvVol = adopted;
@@ -14013,7 +14454,7 @@ function scheduleRenew(device, callbackUrl, negotiatedSeconds) {
       console.log("[gena] renewed | negotiated:", result.negotiatedSeconds + "s");
       scheduleRenew(device, callbackUrl, result.negotiatedSeconds);
     } catch (e) {
-      console.error("[gena] renew failed:", e.message, "\u2014 re-subscribing...");
+      console.error("[gena] renew failed:", e.message, ", re-subscribing...");
       try {
         var sub = await subscribe(device, callbackUrl, EVENT_PATH, REQUESTED_TIMEOUT);
         state.sid = sub.sid;
@@ -14022,6 +14463,13 @@ function scheduleRenew(device, callbackUrl, negotiatedSeconds) {
         scheduleRenew(device, callbackUrl, sub.negotiatedSeconds);
       } catch (e2) {
         console.error("[gena] re-subscribe failed:", e2.message);
+        if (state.diag) {
+          state.diag.change(
+            "resub-fail",
+            e2.message,
+            "GENA re-subscribe failed: " + e2.message
+          );
+        }
       }
     }
   }, delayMs);
@@ -14087,7 +14535,55 @@ function pad6(n) {
   while (s.length < 6) s = "0" + s;
   return s;
 }
+function runStartupProbes() {
+  var extra = [];
+  var ih = state.inputHandle;
+  var open = ih && ih.devices ? ih.devices.length : 0;
+  var live = ih && ih.live ? ih.live().length : 0;
+  extra.push({
+    name: "input",
+    ok: open > 0,
+    detail: open ? open + " device(s) open, " + live + " producing events" + (live ? "" : " (normal until a volume key is pressed)") : "no input devices opened. Remote volume keys will not be seen"
+  });
+  extra.push({
+    name: "sonos",
+    ok: !!state.device,
+    detail: state.device ? "connected to " + (state.config && state.config.sonosModel || "player") : "no player connected"
+  });
+  compatLib.runProbes(extra, function(results) {
+    state.probes = results;
+    var failed = results.filter(function(r) {
+      return !r.ok;
+    });
+    results.forEach(function(r) {
+      state.diag.write(
+        r.ok ? "info" : "warn",
+        "probe " + r.name + ": " + (r.ok ? "ok" : "FAILED") + ", " + r.detail
+      );
+    });
+    if (failed.length) {
+      console.warn("[compat] " + failed.length + " dependency check(s) failed: " + failed.map(function(r) {
+        return r.name;
+      }).join(", ") + ", see the Diagnostics screen in the Setup app.");
+    } else {
+      console.log("[compat] all dependency checks passed.");
+    }
+  });
+}
 async function main() {
+  state.diag = new diagLib.DiagLog(DIAG_FILE);
+  state.platform = compatLib.readPlatform();
+  state.compat = compatLib.checkPlatform(state.platform);
+  state.diag.info("--- service start, v" + pkg.version + " ---");
+  state.diag.info("platform: webOS " + (state.platform.release || "unknown") + " on " + (state.platform.model || "unknown model") + ", node " + state.platform.node);
+  state.diag.write(
+    state.compat.status === "tested" ? "info" : "warn",
+    "compatibility: " + state.compat.status + ", " + state.compat.message
+  );
+  console.log("[compat] " + state.compat.message);
+  if (state.compat.status !== "tested") {
+    console.warn("[compat] This build is not blocked from running. If something misbehaves, open the Setup app and save the diagnostics report.");
+  }
   openPorts();
   state.server = startListener(DEFAULT_LISTEN_PORT, onGenaNotify);
   state.wss = new WebSocketServer({ port: DEFAULT_WS_PORT });
@@ -14102,16 +14598,18 @@ async function main() {
   var config = readConfig();
   if (config) {
     state.config = config;
-    console.log("[main] config found \u2014 connecting to Sonos at", config.sonosIp);
+    console.log("[main] config found, connecting to Sonos at", config.sonosIp);
     await connectToSonos(config);
   } else {
-    console.log("[main] no config \u2014 waiting for setup via the Setup app.");
+    console.log("[main] no config, waiting for setup via the Setup app.");
   }
   startPeriodicSync();
+  runStartupProbes();
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }
 main().catch(function(err) {
   console.error("[fatal]", err.message);
+  if (state.diag) state.diag.error("fatal: " + err.message);
   process.exit(1);
 });

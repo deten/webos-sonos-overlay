@@ -45,7 +45,7 @@ async function main() {
   } else {
     console.log('[main] discovering Sonos via SSDP...');
     device = await discoverSonos({ timeoutMs: 8000 });
-    console.log('[main] found device at', device.ip + ':' + device.port, '—', device.location);
+    console.log('[main] found device at', device.ip + ':' + device.port, '', device.location);
   }
   state.device = device;
 
@@ -71,7 +71,7 @@ async function main() {
 
   var vol = await getVolume(device);
   console.log('[main] current volume:', vol);
-  console.log('[main] ready — change volume via Sonos app or remote to see events.');
+  console.log('[main] ready, change volume via Sonos app or remote to see events.');
   console.log('[main] uncomment testSetGet() in main() for a round-trip test.');
   console.log('[main] Ctrl-C to quit.\n');
 
@@ -99,7 +99,7 @@ function onNotify(headers, rawBody, recvAt) {
   if (nts && nts !== 'upnp:propchange') return;
 
   // Sequence gap detection.
-  // Note: Sonos may reset SEQ to 0 after re-subscribe — treat that as a reset,
+  // Note: Sonos may reset SEQ to 0 after re-subscribe, treat that as a reset,
   // not a gap, to avoid false-positive warnings.
   if (sid === state.sid) {
     if (seq !== state.seqExpected && !(seq === 0 && state.seqExpected > 0)) {
@@ -132,9 +132,9 @@ function onNotify(headers, rawBody, recvAt) {
   var masterVol = null;
   entries.forEach(function(e) {
     if (e.name === 'Volume' && e.channel === 'Master') masterVol = e.val;
-    // Log if a VolumeMaster state variable appears — the prompt wants to know.
+    // Log if a VolumeMaster state variable appears, the prompt wants to know.
     if (e.name === 'VolumeMaster') {
-      console.log('[notify] VolumeMaster state variable found — val:', e.val);
+      console.log('[notify] VolumeMaster state variable found, val:', e.val);
     }
   });
 
@@ -182,7 +182,7 @@ function scheduleRenew(device, callbackUrl, negotiatedSeconds) {
                   '| negotiated:', result.negotiatedSeconds + 's');
       scheduleRenew(device, callbackUrl, result.negotiatedSeconds);
     } catch(e) {
-      console.error('[gena] renew failed:', e.message, '— attempting re-subscribe...');
+      console.error('[gena] renew failed:', e.message, ', attempting re-subscribe...');
       try {
         var sub = await subscribe(device, callbackUrl, EVENT_PATH, REQUESTED_TIMEOUT);
         state.sid         = sub.sid;
@@ -191,14 +191,14 @@ function scheduleRenew(device, callbackUrl, negotiatedSeconds) {
         scheduleRenew(device, callbackUrl, sub.negotiatedSeconds);
       } catch(e2) {
         console.error('[gena] re-subscribe failed:', e2.message,
-                      '— events will stop. Restart the script.');
+                      ', events will stop. Restart the script.');
       }
     }
   }, delayMs);
 }
 
 // ---------------------------------------------------------------------------
-// Test helper — call manually or uncomment in main()
+// Test helper: call manually or uncomment in main()
 // ---------------------------------------------------------------------------
 async function testSetGet(device) {
   var before = await getVolume(device);
@@ -208,7 +208,7 @@ async function testSetGet(device) {
   console.log('\n[test] getVolume before:', before, '→ setting to:', target);
   state.pendingSet = { volume: target, sentAt: process.hrtime() };
   await setVolume(device, target);
-  console.log('[test] setVolume sent — waiting for GENA confirmation...');
+  console.log('[test] setVolume sent, waiting for GENA confirmation...');
 
   await delay(5000);
 

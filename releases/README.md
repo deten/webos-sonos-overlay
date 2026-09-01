@@ -13,7 +13,7 @@ One folder per deployed build, named `v<version>` after the `version` field in
 To cut a new one, bump `version` in `package.json` and run `npm run release`.
 It refuses to overwrite an existing folder unless given `--force`.
 
-These folders are snapshots, not build inputs — nothing reads from them. Delete
+These folders are snapshots, not build inputs. Nothing reads from them, so delete
 any of them whenever they stop being useful.
 
 ## Rolling back

@@ -43,32 +43,32 @@ var CONFIG_FILE = CONFIG_DIR + '/config.json';
 var DIAG_FILE   = CONFIG_DIR + '/diagnostics.log';
 
 // Connect retry backoff. The TV cold-boots on every power-on, so the service
-// always races Wi-Fi association and DHCP — a single attempt is not enough.
+// always races Wi-Fi association and DHCP; a single attempt is not enough.
 var RETRY_BASE_MS = 3000;
 var RETRY_MAX_MS  = 60000;
 var SYNC_INTERVAL_MS = 10000;
 
 // The TV leads. Its own counter is what the OSD draws, so we never overwrite it
-// and there is nothing to predict — we read the TV's real value and mirror it to
+// and there is nothing to predict; we read the TV's real value and mirror it to
 // the Arc. This removes the whole prediction/step-learning path, and with it the
 // wrong-first-digit flash that came from fighting LG's own OSD.
 //
 // The TV moves 1 per press; the Arc moves 2 per CEC press. Measured 2026-08-21
 // from isolated presses with nothing writing the TV (TV 9->8->7 one press each,
 // while a 17-press burst moved the TV +17 and the Arc +32). So the Arc's volume
-// is exactly twice the TV's, and CEC lands on the correct value by itself —
+// is exactly twice the TV's, and CEC lands on the correct value by itself;
 // under this mapping a normal press needs no correction at all. Under the old
 // 1:1 map every press overshot the Arc by 1 and the settle yanked it back.
 var TV_TO_SONOS_RATIO = 2;
 
-// Absolute ceiling, expressed on the SONOS scale — that is the side that gets
+// Absolute ceiling, expressed on the SONOS scale; that is the side that gets
 // loud. With the 2:1 mapping this caps the TV at half as much (70 -> TV 35).
 // Nothing this service writes to the Sonos may exceed it, whatever the TV says.
 // Override per-install with "maxVolume" in config.json.
 var DEFAULT_MAX_VOLUME = 70;
 
 // A single correction may never raise the Sonos by more than this. Downward
-// corrections are unrestricted — quieter is always safe. Normal use never trips
+// corrections are unrestricted; quieter is always safe. Normal use never trips
 // it: CEC moves the Arc live during a burst, so the gap stays small.
 var MAX_RAISE_PER_CORRECTION = 20;
 
@@ -78,7 +78,7 @@ var MAX_RAISE_PER_CORRECTION = 20;
 var SETTLE_MS      = 400;
 var SETTLE_POLL_MS = 700;
 
-// No eARC session means CEC presses never reach the Arc — but the TV still
+// No eARC session means CEC presses never reach the Arc, but the TV still
 // moves its own counter, and we mirror that counter to the Arc on every settle.
 // The old SOAP-fallback special case is therefore gone: one path covers both.
 
@@ -104,7 +104,7 @@ var state = {
   compat:        null,   // tested | untested | unknown
   probes:        [],     // dependency probe results
   diag:          null,   // persistent diagnostics log
-  tvVol:           null,  // last value read from the TV — the source of truth
+  tvVol:           null,  // last value read from the TV, the source of truth
   sonosVol:        null,  // last value the Arc reported, via GENA or SOAP
   pendingSonosWrite: null, // a SetVolume we issued, so its echo is not "external"
   optimisticMuted: false,
@@ -135,6 +135,13 @@ function buildDiagnosticsReport() {
   L.push('=========================');
   L.push('generated:   ' + new Date().toISOString());
   L.push('app version: ' + pkg.version);
+  L.push('');
+  // One line carrying everything needed to decide whether this TV is supported,
+  // so a report can be triaged without reading the rest of the file.
+  L.push('DEVICE: ' + (p.model || 'unknown model') +
+         ' / webOS ' + (p.release || 'unknown') +
+         ' / node ' + (p.node || 'unknown') +
+         ' / ' + (c.status || 'unknown'));
   L.push('');
   L.push('Platform');
   L.push('--------');
@@ -199,7 +206,7 @@ function saveConfig(cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// iptables — open ports silently; errors are non-fatal
+// iptables: open ports silently; errors are non-fatal
 // ---------------------------------------------------------------------------
 function openPorts() {
   [DEFAULT_LISTEN_PORT, DEFAULT_WS_PORT, API_PORT].forEach(function(p) {
@@ -243,7 +250,7 @@ function scanSonos(timeoutMs) {
             var um = data.match(/<UDN>([^<]+)<\/UDN>/);
             if (rm) dev.name  = rm[1];
             if (mm) dev.model = mm[1];
-            // UDN is the only stable identifier — roomName is not unique
+            // UDN is the only stable identifier; roomName is not unique
             // (Arc, Sub and both Era 300s all report "Family Room").
             if (um) dev.uuid  = um[1];
             if (--pending === 0) resolve(devices);
@@ -422,7 +429,7 @@ async function resolveDevice(config) {
       console.warn('[resolve] stored IP', config.sonosIp, 'unreachable:', e.message);
       if (state.diag) {
         state.diag.info('stored Sonos IP unreachable (' + e.message +
-          ') — falling back to discovery');
+          '), falling back to discovery');
       }
     }
   }
@@ -438,7 +445,7 @@ async function resolveDevice(config) {
     if (match) console.log('[resolve] matched stored UUID at', match.ip);
   }
 
-  // Fall back to room name, but only when it identifies exactly one player —
+  // Fall back to room name, but only when it identifies exactly one player 
   // several speakers share a room name, so an ambiguous match is a wrong match.
   if (!match && config.sonosName) {
     var byName = devices.filter(function(d) {
@@ -450,7 +457,7 @@ async function resolveDevice(config) {
       console.log('[resolve] matched name+model at', match.ip);
     } else if (byName.length > 1) {
       console.warn('[resolve]', byName.length, 'players share room "' + config.sonosName +
-        '" — cannot disambiguate without a stored UUID');
+        '", cannot disambiguate without a stored UUID');
     }
   }
 
@@ -467,7 +474,7 @@ async function resolveDevice(config) {
 
 // ---------------------------------------------------------------------------
 // Connect to Sonos (called on startup if configured, or after /api/config)
-// Retries with capped exponential backoff — never gives up.
+// Retries with capped exponential backoff, never gives up.
 // ---------------------------------------------------------------------------
 async function connectToSonos(config, attempt) {
   if (state.connecting) return;
@@ -507,7 +514,7 @@ async function connectToSonos(config, attempt) {
     state.correlator.lastMuted = false;
     console.log('[main] current volume:', initVol);
 
-    // Boot seed — the one time the Sonos leads. The TV keeps whatever value it
+    // Boot seed, the one time the Sonos leads. The TV keeps whatever value it
     // booted with, so align it to the Arc once; from here on the TV leads and
     // this is never written again in normal operation. Seeding also guarantees
     // the two agree before the first correction, so switching the direction of
@@ -551,7 +558,7 @@ async function connectToSonos(config, attempt) {
       });
     }
 
-    console.log('\n[main] ready — press Vol+/Vol−/Mute on the remote.\n');
+    console.log('\n[main] ready, press Vol+/Vol−/Mute on the remote.\n');
   } catch (e) {
     console.error('[main] connect failed (attempt ' + (attempt + 1) + '):', e.message);
     if (state.diag) {
@@ -583,7 +590,7 @@ function onInputEvent(event) {
   onVolumeKey(event.direction);
 }
 
-// The TV has already drawn its own number by the time this runs — that is the
+// The TV has already drawn its own number by the time this runs; that is the
 // snappiness, and it now costs nothing because we no longer overwrite it. All
 // this does is arm the timer that mirrors the result to the Arc.
 function onVolumeKey(direction) {
@@ -619,7 +626,7 @@ function refreshTransportState() {
 }
 
 // After the remote goes quiet, take the Sonos at its word. This is the only
-// path that is guaranteed to run — GENA may have delivered its last event
+// path that is guaranteed to run; GENA may have delivered its last event
 // mid-burst, and during silent playback it does not emit at all.
 function scheduleSettle() {
   if (state.settleTimer) clearTimeout(state.settleTimer);
@@ -632,7 +639,7 @@ function scheduleSettle() {
 
 // The TV leads, always. Read its counter, mirror it to the Arc. Nothing here
 // writes back to the TV except to enforce the ceiling, so the number on screen
-// is never yanked out from under the user — which is exactly what the old
+// is never yanked out from under the user, which is exactly what the old
 // two-way version did on every single press once the two sides had drifted.
 function reconcileTvAndSonos() {
   if (!state.device) return;
@@ -644,7 +651,7 @@ function reconcileTvAndSonos() {
     // honest instead of climbing past a level the Arc will never reach.
     var tvCap = maxTvVol();
     if (tvVol > tvCap) {
-      console.warn('[cap] TV at', tvVol, '— holding at TV ceiling', tvCap,
+      console.warn('[cap] TV at', tvVol, ', holding at TV ceiling', tvCap,
         '(Sonos ' + state.maxVolume + ')');
       pushTvVolume(tvCap);
       state.tvVol = tvCap;
@@ -682,7 +689,7 @@ function reconcileTvAndSonos() {
 // The old version learned the per-press "step" from these events without ever
 // checking that a keypress had caused them. A volume change made in the Sonos
 // app therefore taught it a step of 9 or 10, and every later press jumped by
-// that much. There is no step to learn any more — we read the TV's real value.
+// that much. There is no step to learn any more; we read the TV's real value.
 function reconcile(genaVol, genaMuted) {
   if (genaMuted !== null) state.optimisticMuted = genaMuted;
   if (genaVol === null) return;
@@ -702,11 +709,11 @@ function reconcile(genaVol, genaMuted) {
 
   // Nothing we did, and no key was pressed: someone moved it in the Sonos app.
   // Adopt it into the TV rather than reverting it, so app control keeps working
-  // — otherwise TV-leads would silently undo every change made from a phone.
+  //, otherwise TV-leads would silently undo every change made from a phone.
   if (state.tvVol !== null && genaVol !== tvToSonos(state.tvVol)) {
     var adopted = Math.min(sonosToTv(genaVol), maxTvVol());
     console.log('[extern] Arc moved', prev, '->', genaVol,
-      'with no keypress — adopting into TV as', adopted);
+      'with no keypress, adopting into TV as', adopted);
     state.tvVol = adopted;
     pushTvVolume(adopted);
   }
@@ -751,7 +758,7 @@ function onGenaNotify(headers, rawBody, recvAt) {
 // ---------------------------------------------------------------------------
 // WebSocket broadcast
 // ---------------------------------------------------------------------------
-// Write the TV's stored volume. This is also what puts the number on screen —
+// Write the TV's stored volume. This is also what puts the number on screen 
 // the native OSD renders in response to this call.
 function pushTvVolume(vol) {
   if (vol === null || vol === undefined || isNaN(vol)) return;
@@ -761,7 +768,7 @@ function pushTvVolume(vol) {
   );
 }
 
-// Read the TV's stored volume. cb(number|null) — never throws.
+// Read the TV's stored volume. cb(number|null), never throws.
 function readTvVolume(cb) {
   cp.exec(
     '/usr/bin/luna-send -n 1 -f luna://com.webos.service.audio/master/getVolume \'{}\' 2>/dev/null',
@@ -780,7 +787,7 @@ function readTvVolume(cb) {
 function broadcastVolume(vol, muted) {
   reconcile(vol, muted);
 
-  // Report the TV's own value — it is what the OSD is showing and what the Arc
+  // Report the TV's own value; it is what the OSD is showing and what the Arc
   // is being driven to. Falls back to the Arc's value before the first TV read.
   var sendVol   = state.tvVol !== null ? state.tvVol
                 : state.sonosVol !== null ? state.sonosVol : 0;
@@ -807,7 +814,7 @@ function scheduleRenew(device, callbackUrl, negotiatedSeconds) {
       console.log('[gena] renewed | negotiated:', result.negotiatedSeconds + 's');
       scheduleRenew(device, callbackUrl, result.negotiatedSeconds);
     } catch (e) {
-      console.error('[gena] renew failed:', e.message, '— re-subscribing...');
+      console.error('[gena] renew failed:', e.message, ', re-subscribing...');
       try {
         var sub = await subscribe(device, callbackUrl, EVENT_PATH, REQUESTED_TIMEOUT);
         state.sid = sub.sid; state.seqExpected = 0;
@@ -825,7 +832,7 @@ function scheduleRenew(device, callbackUrl, negotiatedSeconds) {
 }
 
 // ---------------------------------------------------------------------------
-// Periodic sync — silently re-polls Sonos every 60s so lastVol stays accurate
+// Periodic sync: silently re-polls Sonos every 60s so lastVol stays accurate
 // after screensaver/sleep without triggering the OSD
 // ---------------------------------------------------------------------------
 function startPeriodicSync() {
@@ -889,13 +896,13 @@ function pad6(n)   { var s = String(n); while (s.length < 6) s = '0' + s; return
 
 // ---------------------------------------------------------------------------
 // Entry point
-// Reports what the platform supports. Advisory only — nothing here stops the
+// Reports what the platform supports. Advisory only, nothing here stops the
 // service, because a partial failure (say, no overlay) still leaves volume sync
 // working, and the user is better served by a running service and a clear log.
 function runStartupProbes() {
   var extra = [];
 
-  // Devices are opened speculatively — only one carries the remote's volume
+  // Devices are opened speculatively, only one carries the remote's volume
   // keys, and which /dev/input/eventN that is shifts between boots. So "open"
   // is the health signal; "live" only becomes true after a real keypress.
   var ih   = state.inputHandle;
@@ -907,7 +914,7 @@ function runStartupProbes() {
     detail: open
       ? open + ' device(s) open, ' + live + ' producing events' +
         (live ? '' : ' (normal until a volume key is pressed)')
-      : 'no input devices opened — remote volume keys will not be seen'
+      : 'no input devices opened. Remote volume keys will not be seen'
   });
 
   extra.push({
@@ -923,12 +930,12 @@ function runStartupProbes() {
     var failed = results.filter(function (r) { return !r.ok; });
     results.forEach(function (r) {
       state.diag.write(r.ok ? 'info' : 'warn',
-        'probe ' + r.name + ': ' + (r.ok ? 'ok' : 'FAILED') + ' — ' + r.detail);
+        'probe ' + r.name + ': ' + (r.ok ? 'ok' : 'FAILED') + ', ' + r.detail);
     });
     if (failed.length) {
       console.warn('[compat] ' + failed.length + ' dependency check(s) failed: ' +
         failed.map(function (r) { return r.name; }).join(', ') +
-        ' — see the Diagnostics screen in the Setup app.');
+        ', see the Diagnostics screen in the Setup app.');
     } else {
       console.log('[compat] all dependency checks passed.');
     }
@@ -946,7 +953,7 @@ async function main() {
     ' on ' + (state.platform.model || 'unknown model') +
     ', node ' + state.platform.node);
   state.diag.write(state.compat.status === 'tested' ? 'info' : 'warn',
-    'compatibility: ' + state.compat.status + ' — ' + state.compat.message);
+    'compatibility: ' + state.compat.status + ', ' + state.compat.message);
 
   console.log('[compat] ' + state.compat.message);
   if (state.compat.status !== 'tested') {
@@ -968,10 +975,10 @@ async function main() {
   var config = readConfig();
   if (config) {
     state.config = config;
-    console.log('[main] config found — connecting to Sonos at', config.sonosIp);
+    console.log('[main] config found, connecting to Sonos at', config.sonosIp);
     await connectToSonos(config);
   } else {
-    console.log('[main] no config — waiting for setup via the Setup app.');
+    console.log('[main] no config, waiting for setup via the Setup app.');
   }
 
   startPeriodicSync();

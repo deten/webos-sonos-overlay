@@ -218,7 +218,7 @@ h2 { font-size:48px; font-weight:700; margin-bottom:16px; line-height:1.15; }
     <div class="screen" id="s2">
       <div class="card">
         <h2>Testing connection…</h2>
-        <div class="subtitle" id="test-subtitle">Connecting to <span id="test-ip">—</span></div>
+        <div class="subtitle" id="test-subtitle">Connecting to <span id="test-ip">...</span></div>
         <div class="spinner" id="test-spinner"></div>
         <div class="note" id="test-note"></div>
         <div class="btn-row" id="test-btns" style="display:none">
@@ -251,7 +251,7 @@ h2 { font-size:48px; font-weight:700; margin-bottom:16px; line-height:1.15; }
         <div class="btn-row">
           <button class="btn btn-ghost" id="btn-skip-arc" onclick="finishSetup()">Skip &amp; Finish</button>
           <button class="btn btn-primary" id="btn-arc-done" onclick="finishSetup()" style="display:none">
-            Looks good — Finish ✓
+            Looks good, finish ✓
           </button>
         </div>
       </div>
@@ -362,7 +362,7 @@ function apiPost(path, body) {
 // ── Screen navigation ──────────────────────────────────────────────────────
 var lastStatus = null;
 
-// Renders the tested/untested banner. Advisory only — nothing is ever blocked.
+// Renders the tested/untested banner. Advisory only, nothing is ever blocked.
 function renderCompat(status) {
   lastStatus = status;
   var el = document.getElementById('compat-banner');
@@ -444,7 +444,7 @@ function startService() {
   var note = document.getElementById('start-note');
   note.textContent = '';
 
-  // Try API first — service may already be running
+  // Try API first, service may already be running
   apiGet('/api/status').then(function(s) {
     if (s.ok) { onServiceReady(s); return; }
     throw new Error('not ready');
@@ -479,11 +479,11 @@ function onServiceReady(status) {
   // Tell the overlay to hide so it doesn't intercept cursor input during setup
   apiPost('/api/setup-mode', {}).catch(function() {});
 
-  // Advisory only — an untested version still proceeds through setup.
+  // Advisory only, an untested version still proceeds through setup.
   renderCompat(status);
 
   if (status.configured && status.connected) {
-    // Already working — jump to ARC test
+    // Already working, jump to ARC test
     selectedIp   = status.sonosIp;
     selectedName = status.sonosName || status.sonosIp;
     goTo(3);
@@ -657,7 +657,7 @@ function finishSetup() {
     }
   });
 
-  // Do NOT launch overlay here — it would block input on this screen.
+  // Do NOT launch overlay here, it would block input on this screen.
   // Overlay launches when the user presses Close Setup.
   goTo(4);
 }
@@ -676,7 +676,7 @@ if (window.PalmSystem) {
   window.PalmSystem.stageReady();
 }
 
-// Nothing to pre-close — native OSD handles volume display, no separate overlay app
+// Nothing to pre-close, native OSD handles volume display, no separate overlay app
 
 startService();
 </script>
