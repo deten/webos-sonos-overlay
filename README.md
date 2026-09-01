@@ -1,5 +1,12 @@
 # webos-sonos-overlay
 
+> **This is in testing. Use at your own risk.**
+>
+> It requires a rooted TV, patches a system file belonging to the compositor, and
+> changes the volume of real speakers. It has been tested on one TV so far (see
+> [Compatibility](#compatibility)). Expect rough edges, and do not install it on a
+> TV you are not willing to troubleshoot.
+
 An LG webOS background service that keeps a Sonos soundbar's volume locked to the
 TV's own volume, and draws a matching on-screen volume indicator.
 
