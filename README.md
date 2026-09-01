@@ -33,6 +33,27 @@ restores the indicator and keeps the two scales in agreement.**
 - **Survives cold boot.** The TV fully cold-boots on every power-on; the service
   retries with backoff through Wi-Fi association and DHCP.
 
+## Installing
+
+No PC and no ssh required. The app is published as a Homebrew Channel repository,
+so it installs on the TV like any other homebrew app.
+
+1. On the TV, open **Homebrew Channel**, go to **Settings**, and choose
+   **Add repository**.
+2. Enter:
+
+   ```
+   https://raw.githubusercontent.com/deten/webos-sonos-overlay/main/repo/
+   ```
+
+3. Go back to the app list. **Sonos Volume Overlay** appears. Install it.
+4. Launch it once. It finds your Sonos, tests the connection, and offers to
+   install the boot hook so it starts automatically from then on.
+
+Homebrew Channel must already be installed, since the TV has to be rooted for any
+of this to work. Nothing else is needed: the package carries the service, the
+overlay, and the setup app.
+
 ## Requirements
 
 - LG TV running webOS 6.x, rooted, with the Homebrew Channel installed
@@ -82,6 +103,20 @@ npm run deploy-ipk      # package and install over ssh
 npm run deploy          # push just the service bundle
 npm run launch-overlay  # start the overlay app
 ```
+
+## Publishing a release
+
+1. Bump `version` in `package.json`.
+2. `npm run release` builds and snapshots into `releases/v<version>/`.
+3. `npm run build-repo` regenerates `repo/apps.json` and the manifest, filling in
+   the new version, the ipk sha256 and size, and the release asset URL. It also
+   writes `dist/<id>_<version>_all.ipk` under the name the manifest expects.
+4. Create a GitHub release tagged `v<version>` and attach that ipk.
+5. Commit and push `repo/`. Homebrew Channel picks up the new version on its next
+   refresh.
+
+The repository URL that users add points at `repo/` on the default branch, so the
+listing updates as soon as step 5 lands.
 
 ## Releases
 
