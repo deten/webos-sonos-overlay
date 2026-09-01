@@ -197,7 +197,26 @@ shows an advisory banner and setup continues normally.
 
 ## Reading the logs
 
-With this repository checked out and `deploy.config.json` filled in:
+### If you installed from the repository or the ipk
+
+This is the normal case, and it needs nothing installed on your computer.
+
+1. On the TV, open **Sonos Volume Overlay** and choose **Diagnostics** on the last
+   screen.
+2. It shows an address like `http://<tv-ip>:7476/api/diagnostics`. Open that in a
+   browser on your phone or computer, on the same network. It downloads a text
+   file.
+
+That file is the whole picture: webOS version, TV model, the result of every
+dependency check, the current volume state, and the service's event log. You can
+also go straight to the address if you already know the TV's IP.
+
+### If you built from source
+
+These need the repository checked out, Node installed, and `deploy.config.json`
+filled in with your TV's address and an ssh key. **They do not work with a
+repository or ipk install**, which is most people. Use the Diagnostics screen
+above instead.
 
 ```
 npm run logs                 # last 80 runtime lines plus the persistent log
@@ -205,36 +224,32 @@ npm run logs -- --follow     # follow the runtime log live
 npm run fetch-logs           # copy both logs into the current directory
 ```
 
-Or over ssh directly:
+Or over ssh directly, if you have shell access to the TV:
 
 ```
 ssh root@<tv-ip> "tail -50 /var/log/sonos-overlay.log"
 ssh root@<tv-ip> "tail -f /var/log/sonos-overlay.log"
 ```
 
-There are two logs. `/var/log/sonos-overlay.log` is the full runtime log and is
-lost on every reboot, because that path is a ramfs.
-`/var/lib/com.brineandbuild.sonosoverlay/diagnostics.log` holds only notable
-events, survives a reboot, and is capped in size.
+### The two logs
+
+`/var/log/sonos-overlay.log` is the full runtime log, with every volume event. It
+is lost on every reboot, because that path is a ramfs. Use it for something
+happening right now.
+
+`/var/lib/com.brineandbuild.sonosoverlay/diagnostics.log` records only notable
+events, is capped in size, and survives a reboot. It is the one included in the
+diagnostics report.
 
 ## Reporting a problem
 
-The service keeps a diagnostics log at
-`/var/lib/com.brineandbuild.sonosoverlay/diagnostics.log`. Unlike `/var/log`, this
-survives a reboot, and it is size-capped so it cannot grow without bound.
+Get the diagnostics file as described in
+[Reading the logs](#reading-the-logs), then attach it to a new issue on this
+repository. Say what you expected to happen and what happened instead, or just
+say it works if you are reporting a TV that is not in the table yet.
 
-To send it:
-
-1. On the TV, open the Sonos Overlay app and choose **Diagnostics** on the last screen.
-2. It shows an address like `http://<tv-ip>:7476/api/diagnostics`. Open that in a
-   browser on your phone or computer, on the same network; it downloads a text file.
-3. Attach that file to a new issue on this repository. Say what you expected to
-   happen and what happened instead, or just say it works if you are reporting a
-   TV that is not in the table yet.
-
-The report contains the webOS version, TV model, the result of each dependency probe,
-current volume state, and the service's event log. **Network addresses are masked**
-(`192.168.x.x`), and it deliberately reads no serial number, device id, or MAC address.
+**Network addresses are masked** (`192.168.x.x`), and the report deliberately
+reads no serial number, device id, or MAC address.
 
 ## Configuration
 

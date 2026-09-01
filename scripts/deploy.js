@@ -28,9 +28,13 @@ function loadConfig() {
   cfg.appId  = cfg.appId  || 'com.brineandbuild.sonosoverlay';
 
   if (!cfg.tvIp) {
-    fail('No TV address configured.\n' +
-         'Copy deploy.config.example.json to deploy.config.json and set "tvIp",\n' +
-         'or run with TV_IP=<address>.');
+    fail('No TV address configured.\n\n' +
+         'These commands are for building from source. If you installed from\n' +
+         'the Homebrew Channel repository or from an ipk, they will not work.\n' +
+         'Open the app on the TV and use the Diagnostics screen instead, which\n' +
+         'gives the same logs at http://<tv-ip>:7476/api/diagnostics\n\n' +
+         'To use these anyway, copy deploy.config.example.json to\n' +
+         'deploy.config.json and set "tvIp", or run with TV_IP=<address>.');
   }
   return cfg;
 }
