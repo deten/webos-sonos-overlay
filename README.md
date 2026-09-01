@@ -173,6 +173,7 @@ finds rather than refusing to start.
 | TV model | webOS | TV Node | Status |
 |---|---|---|---|
 | `OLED65C1PUB` (LG C1) | 6.4.0 | v8.12.0 | Working. Overlay, volume sync, and cold-boot survival all confirmed. |
+| LG C1 | 6.5.0 | | Working. Reported by a tester: installed, found the Sonos on scan, and connected. |
 
 If your TV is not listed, it is not known to fail, only unverified. Send a
 diagnostics report (see below) and it will be added to this table. The report's

@@ -39,6 +39,21 @@ var API_PORT            = 7476;
 
 var CONFIG_DIR  = '/var/lib/com.brineandbuild.sonosoverlay';
 var CONFIG_FILE = CONFIG_DIR + '/config.json';
+
+// Patching the compositor's volume QML is what puts the number back on screen.
+// The boot hook runs this on every power-on, and setup runs it once so a fresh
+// install works without needing a reboot first.
+var OVERLAY_APPLY_SH =
+  'QML=/usr/lib/qml/WebOSCompositor/views/volume/StarfishVolume.qml\n' +
+  'PATCHED=/var/lib/com.brineandbuild.sonosoverlay/StarfishVolume.qml\n' +
+  'if [ -f "$QML" ] && grep -q external_arc "$QML" && [ ! -f "$PATCHED" ]; then\n' +
+  '  mkdir -p /var/lib/com.brineandbuild.sonosoverlay\n' +
+  '  sed \'/external_arc/d\' "$QML" > "$PATCHED"\n' +
+  'fi\n' +
+  'if [ -f "$PATCHED" ] && ! grep -q StarfishVolume.qml /proc/mounts; then\n' +
+  '  mount --bind "$PATCHED" "$QML" 2>/dev/null\n' +
+  '  systemctl restart surface-manager-daemon.service 2>/dev/null\n' +
+  'fi\n';
 // Persistent, unlike /var/log which is a ramfs and is wiped on every boot.
 var DIAG_FILE   = CONFIG_DIR + '/diagnostics.log';
 
@@ -361,25 +376,43 @@ function startApiServer() {
       return;
     }
 
+    // Applies the on-screen indicator now, without waiting for a reboot.
+    // Restarting the compositor tears down whatever is on screen, including the
+    // setup app itself, so this is only called as the last step of setup.
+    if (url === '/api/apply-overlay' && req.method === 'POST') {
+      var mounted = false;
+      try {
+        mounted = fs.readFileSync('/proc/mounts', 'utf8')
+                    .indexOf('StarfishVolume.qml') !== -1;
+      } catch (e) { /* treat as not mounted */ }
+
+      if (mounted) {
+        res.end(JSON.stringify({ ok: true, alreadyApplied: true }));
+        return;
+      }
+
+      // Answer before restarting; the restart kills the webview waiting on us.
+      res.end(JSON.stringify({ ok: true, restarting: true }));
+      setTimeout(function() {
+        cp.exec(OVERLAY_APPLY_SH, function(err) {
+          if (err && state.diag) {
+            state.diag.error('apply-overlay failed: ' + err.message);
+          }
+        });
+      }, 600);
+      return;
+    }
+
     if (url === '/api/startup-hook' && req.method === 'POST') {
       var hookDir  = '/var/lib/webosbrew/init.d';
       var hookPath = hookDir + '/sonos-overlay';
+      // The QML steps come from OVERLAY_APPLY_SH so the boot path and the
+      // setup path can never drift apart.
       var script   = '#!/bin/sh\n' +
         'iptables -I INPUT -p tcp --dport 7474 -j ACCEPT 2>/dev/null\n' +
         'iptables -I INPUT -p tcp --dport 7475 -j ACCEPT 2>/dev/null\n' +
         'iptables -I INPUT -p tcp --dport 7476 -j ACCEPT 2>/dev/null\n' +
-        'QML=/usr/lib/qml/WebOSCompositor/views/volume/StarfishVolume.qml\n' +
-        'PATCHED=/var/lib/com.brineandbuild.sonosoverlay/StarfishVolume.qml\n' +
-        '# Generate patched QML on first run or after a firmware update\n' +
-        'if [ -f "$QML" ] && grep -q external_arc "$QML" && [ ! -f "$PATCHED" ]; then\n' +
-        '  mkdir -p /var/lib/com.brineandbuild.sonosoverlay\n' +
-        '  sed \'/external_arc/d\' "$QML" > "$PATCHED"\n' +
-        'fi\n' +
-        '# Apply bind mount and restart compositor only if not already mounted\n' +
-        'if [ -f "$PATCHED" ] && ! grep -q StarfishVolume.qml /proc/mounts; then\n' +
-        '  mount --bind "$PATCHED" "$QML" 2>/dev/null\n' +
-        '  systemctl restart surface-manager-daemon.service 2>/dev/null\n' +
-        'fi\n' +
+        OVERLAY_APPLY_SH +
         'pkill -f \'tv-service.bundle.js\' 2>/dev/null\n' +
         'sleep 1\n' +
         'APP=/media/developer/apps/usr/palm/applications/com.brineandbuild.sonosoverlay\n' +

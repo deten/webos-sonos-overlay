@@ -271,7 +271,7 @@ h2 { font-size:48px; font-weight:700; margin-bottom:16px; line-height:1.15; }
           Support: p0txecpth@gmail.com
         </div>
         <div class="btn-row">
-          <button class="btn btn-primary" onclick="closeApp()">Close Setup</button>
+          <button class="btn btn-primary" id="btn-close" onclick="closeApp()">Close Setup</button>
           <button class="btn btn-secondary" onclick="goTo(1)">Reconfigure</button>
           <button class="btn btn-ghost" onclick="showDiagnostics()">Diagnostics</button>
         </div>
@@ -657,14 +657,42 @@ function finishSetup() {
     }
   });
 
-  // Do NOT launch overlay here, it would block input on this screen.
-  // Overlay launches when the user presses Close Setup.
+  // The indicator is applied when the user presses Close Setup, because that
+  // restarts the compositor and would otherwise interrupt setup.
   goTo(4);
 }
 
+function hideApp() {
+  try {
+    if (window.PalmSystem && window.PalmSystem.hide) { window.PalmSystem.hide(); return; }
+  } catch (e) { /* fall through to close */ }
+  try { window.close(); } catch (e) { /* nothing left to try */ }
+}
+
+// The on-screen indicator needs the compositor's volume QML patched and the
+// compositor restarted. That used to happen only in the boot hook, so a fresh
+// install showed no indicator until the TV was power cycled. Doing it here means
+// setup finishes in a working state. The restart closes this app, which is what
+// the button was for anyway.
 function closeApp() {
-  if (window.PalmSystem) window.PalmSystem.hide();
-  else window.close();
+  var note = document.getElementById('done-details');
+  var btn  = document.getElementById('btn-close');
+  if (btn) { btn.disabled = true; btn.textContent = 'Finishing...'; }
+
+  apiPost('/api/apply-overlay', {}).then(function(res) {
+    if (res && res.restarting) {
+      if (note) {
+        note.className = 'note';
+        note.textContent = 'Setting up the on-screen indicator. The screen will ' +
+          'go black for a few seconds and return to the home screen. That is normal.';
+      }
+      // The compositor restart tears this app down; nothing more to do.
+      return;
+    }
+    hideApp();
+  }).catch(function() {
+    hideApp();
+  });
 }
 
 function esc(s) {
