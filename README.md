@@ -86,6 +86,45 @@ existing folder without `--force`.
 The folders are snapshots, not build inputs. Nothing reads from them, so old
 ones can be deleted whenever they stop being useful. See `releases/README.md`.
 
+## Compatibility
+
+Tested on **webOS 6.4.0** (LG C1, `OLED65C1PUB`, TV-side Node v8.12.0). Nothing is
+version-locked — the service runs on any release and reports what it finds rather
+than refusing to start.
+
+Several things it depends on are internal to webOS and can move between releases:
+
+| Dependency | Why it can break |
+|---|---|
+| Compositor volume QML | The overlay works by removing an `external_arc` guard from `StarfishVolume.qml`. A different path or a rewritten file means no indicator. |
+| `com.webos.service.audio` | Reading and writing the TV's volume. If the service name or reply shape changes, sync stops. |
+| TV-side Node version | The bundle targets Node 8. An older runtime will not parse it. |
+| `/dev/input` event devices | Device numbering already shifts between boots on a single TV; a different input layout changes which device carries volume keys. |
+| Homebrew Channel init hook | `/var/lib/webosbrew/init.d` is what makes the service survive a power cycle. |
+| `iptables` | Used to open the service's ports. |
+
+On startup the service identifies the platform and probes each of these, then logs
+one line saying whether this release is tested. On an untested release the Setup app
+shows an advisory banner and setup continues normally.
+
+## Reporting a problem
+
+The service keeps a diagnostics log at
+`/var/lib/com.brineandbuild.sonosoverlay/diagnostics.log`. Unlike `/var/log`, this
+survives a reboot, and it is size-capped so it cannot grow without bound.
+
+To send it:
+
+1. On the TV, open the Sonos Overlay app and choose **Diagnostics** on the last screen.
+2. It shows an address like `http://<tv-ip>:7476/api/diagnostics`. Open that in a
+   browser on your phone or computer, on the same network — it downloads a text file.
+3. Attach that file to a new issue on this repository, and say what you expected to
+   happen and what happened instead.
+
+The report contains the webOS version, TV model, the result of each dependency probe,
+current volume state, and the service's event log. **Network addresses are masked**
+(`192.168.x.x`), and it deliberately reads no serial number, device id, or MAC address.
+
 ## Configuration
 
 Written by the setup app to `/var/lib/com.brineandbuild.sonosoverlay/config.json`:

@@ -125,6 +125,38 @@ h2 { font-size:48px; font-weight:700; margin-bottom:16px; line-height:1.15; }
 
 /* ── Done check ── */
 .big-check { font-size:96px; margin-bottom:24px; }
+
+/* ── Compatibility banner ── */
+#compat-banner {
+  display:none; margin:0 48px 20px; padding:16px 22px; border-radius:12px;
+  font-size:19px; line-height:1.45; text-align:left;
+}
+#compat-banner.warn    { background:#3a3000; border:1px solid #7a6600; color:#ffd75e; }
+#compat-banner.unknown { background:#26262b; border:1px solid #4a4a55; color:#c8c8d0; }
+#compat-banner b { display:block; margin-bottom:4px; font-size:20px; }
+
+/* ── Diagnostics ── */
+.diag-list { text-align:left; margin:0 0 20px; }
+.diag-row {
+  display:flex; align-items:flex-start; gap:12px;
+  padding:9px 0; border-bottom:1px solid #2a2a30; font-size:18px;
+}
+.diag-row:last-child { border-bottom:none; }
+.diag-badge {
+  flex:0 0 auto; min-width:58px; text-align:center; border-radius:6px;
+  padding:2px 8px; font-size:15px; font-weight:600;
+}
+.diag-badge.ok   { background:#123d1c; color:#5edb84; }
+.diag-badge.fail { background:#3d1212; color:#ff7b7b; }
+.diag-name { flex:0 0 130px; color:#e8e8ee; font-weight:600; }
+.diag-detail { flex:1; color:#9a9aa5; }
+.diag-url {
+  display:block; margin:14px 0 6px; padding:14px 18px; border-radius:10px;
+  background:#101014; border:1px solid #33333d; color:#7fd1ff;
+  font-family:monospace; font-size:24px; word-break:break-all;
+}
+.diag-steps { text-align:left; color:#9a9aa5; font-size:18px; line-height:1.6; }
+.diag-steps li { margin-bottom:8px; }
 </style>
 </head>
 <body>
@@ -133,6 +165,8 @@ h2 { font-size:48px; font-weight:700; margin-bottom:16px; line-height:1.15; }
     <h1>Sonos Volume Overlay</h1>
     <span>Setup</span>
   </header>
+
+  <div id="compat-banner"></div>
 
   <div id="steps">
     <div class="step-dot" id="dot-0"></div>
@@ -239,7 +273,42 @@ h2 { font-size:48px; font-weight:700; margin-bottom:16px; line-height:1.15; }
         <div class="btn-row">
           <button class="btn btn-primary" onclick="closeApp()">Close Setup</button>
           <button class="btn btn-secondary" onclick="goTo(1)">Reconfigure</button>
+          <button class="btn btn-ghost" onclick="showDiagnostics()">Diagnostics</button>
         </div>
+      </div>
+    </div>
+
+    <!-- Step 5: Diagnostics -->
+    <div class="screen" id="s5">
+      <div class="card">
+        <h2>Diagnostics</h2>
+        <div class="subtitle" id="diag-platform">Reading system information…</div>
+
+        <div class="diag-list" id="diag-list"></div>
+
+        <div class="subtitle" style="margin-top:8px">
+          To send this report, open the address below in a browser on your phone
+          or computer, on the same network. It downloads a text file.
+        </div>
+        <code class="diag-url" id="diag-url">…</code>
+
+        <ol class="diag-steps">
+          <li>Open the address above on your phone or computer.</li>
+          <li>Save the file it downloads.</li>
+          <li>Attach it to a new issue at the project's GitHub page, and say what
+              you expected to happen and what happened instead.</li>
+        </ol>
+        <div class="note" style="margin-top:12px;font-size:17px;color:#777;">
+          The report contains your webOS version, TV model, and the service's own
+          event log. Network addresses are masked, and it carries no serial number
+          or account information.
+        </div>
+
+        <div class="btn-row">
+          <button class="btn btn-primary" onclick="goTo(4)">Back</button>
+          <button class="btn btn-ghost" onclick="clearDiagnostics()">Clear log</button>
+        </div>
+        <div class="note" id="diag-note"></div>
       </div>
     </div>
 
@@ -291,6 +360,75 @@ function apiPost(path, body) {
 }
 
 // ── Screen navigation ──────────────────────────────────────────────────────
+var lastStatus = null;
+
+// Renders the tested/untested banner. Advisory only — nothing is ever blocked.
+function renderCompat(status) {
+  lastStatus = status;
+  var el = document.getElementById('compat-banner');
+  var c  = status && status.compat;
+  if (!c || c.status === 'tested') { el.style.display = 'none'; return; }
+
+  el.className   = (c.status === 'unknown') ? 'unknown' : 'warn';
+  el.style.display = 'block';
+  el.innerHTML =
+    '<b>' + (c.status === 'unknown'
+      ? 'Unrecognised webOS version'
+      : 'Untested webOS version') + '</b>' +
+    esc(c.message) +
+    ' Setup will continue normally. If something misbehaves, open Diagnostics ' +
+    'on the last screen.';
+}
+
+function showDiagnostics() {
+  goTo(5);
+  var list = document.getElementById('diag-list');
+  list.innerHTML = '';
+  document.getElementById('diag-note').textContent = '';
+
+  apiGet('/api/status').then(function(st) {
+    var p = st.platform || {};
+    document.getElementById('diag-platform').textContent =
+      'webOS ' + (p.release || 'unknown') +
+      '  ·  ' + (p.model || 'unknown model') +
+      '  ·  node ' + (p.node || '?');
+
+    var host = st.tvIp || location.hostname;
+    document.getElementById('diag-url').textContent =
+      'http://' + host + ':7476/api/diagnostics';
+
+    var probes = st.probes || [];
+    if (!probes.length) {
+      list.innerHTML = '<div class="diag-row"><span class="diag-detail">' +
+        'No checks recorded yet. Restart the service and try again.</span></div>';
+      return;
+    }
+    probes.forEach(function(r) {
+      var row = document.createElement('div');
+      row.className = 'diag-row';
+      row.innerHTML =
+        '<span class="diag-badge ' + (r.ok ? 'ok' : 'fail') + '">' +
+          (r.ok ? 'OK' : 'FAIL') + '</span>' +
+        '<span class="diag-name">' + esc(r.name) + '</span>' +
+        '<span class="diag-detail">' + esc(r.detail) + '</span>';
+      list.appendChild(row);
+    });
+  }).catch(function() {
+    document.getElementById('diag-platform').textContent =
+      'Could not reach the service.';
+  });
+}
+
+function clearDiagnostics() {
+  fetch(API + '/api/diagnostics', { method: 'DELETE' })
+    .then(function() {
+      document.getElementById('diag-note').textContent = 'Event log cleared.';
+    })
+    .catch(function() {
+      document.getElementById('diag-note').textContent = 'Could not clear the log.';
+    });
+}
+
 function goTo(step) {
   document.querySelectorAll('.screen').forEach(function(s) { s.classList.remove('active'); });
   document.getElementById('s' + step).classList.add('active');
@@ -340,6 +478,9 @@ function pollForService(attempts) {
 function onServiceReady(status) {
   // Tell the overlay to hide so it doesn't intercept cursor input during setup
   apiPost('/api/setup-mode', {}).catch(function() {});
+
+  // Advisory only — an untested version still proceeds through setup.
+  renderCompat(status);
 
   if (status.configured && status.connected) {
     // Already working — jump to ARC test

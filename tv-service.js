@@ -12,6 +12,9 @@ var soapLib  = require('./lib/soap');
 var parseLib = require('./lib/parse');
 var inputLib = require('./lib/input');
 var corrLib  = require('./lib/correlator');
+var compatLib = require('./lib/compat');
+var diagLib   = require('./lib/diaglog');
+var pkg       = require('./package.json');
 
 var startListener         = genaLib.startListener;
 var subscribe             = genaLib.subscribe;
@@ -36,6 +39,8 @@ var API_PORT            = 7476;
 
 var CONFIG_DIR  = '/var/lib/com.brineandbuild.sonosoverlay';
 var CONFIG_FILE = CONFIG_DIR + '/config.json';
+// Persistent, unlike /var/log which is a ramfs and is wiped on every boot.
+var DIAG_FILE   = CONFIG_DIR + '/diagnostics.log';
 
 // Connect retry backoff. The TV cold-boots on every power-on, so the service
 // always races Wi-Fi association and DHCP — a single attempt is not enough.
@@ -95,6 +100,10 @@ var state = {
   lastKeyAt:     0,
   genaReceived:  false,
   connecting:    false,
+  platform:      null,   // webOS release / model, read once at startup
+  compat:        null,   // tested | untested | unknown
+  probes:        [],     // dependency probe results
+  diag:          null,   // persistent diagnostics log
   tvVol:           null,  // last value read from the TV — the source of truth
   sonosVol:        null,  // last value the Arc reported, via GENA or SOAP
   pendingSonosWrite: null, // a SetVolume we issued, so its echo is not "external"
@@ -104,6 +113,74 @@ var state = {
   transportState:  null,
   holding:         false,
 };
+
+// ---------------------------------------------------------------------------
+// Diagnostics report
+// ---------------------------------------------------------------------------
+// Addresses are masked. This report is written to be pasted into a public bug
+// report, and nothing in it should identify the user's network or hardware
+// beyond the TV model and firmware needed to reproduce the problem.
+function maskIps(text) {
+  return String(text).replace(
+    /\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g,
+    function (m, a, b) { return a + '.' + b + '.x.x'; });
+}
+
+function buildDiagnosticsReport() {
+  var L = [];
+  var p = state.platform || {};
+  var c = state.compat   || {};
+
+  L.push('Sonos Overlay diagnostics');
+  L.push('=========================');
+  L.push('generated:   ' + new Date().toISOString());
+  L.push('app version: ' + pkg.version);
+  L.push('');
+  L.push('Platform');
+  L.push('--------');
+  L.push('webOS release: ' + (p.release || 'unknown') +
+         (p.source ? '  (via ' + p.source + ')' : ''));
+  L.push('model:         ' + (p.model || 'unknown') +
+         (p.board ? '  [' + p.board + ']' : ''));
+  L.push('TV node:       ' + (p.node || 'unknown'));
+  L.push('compatibility: ' + (c.status || 'unknown').toUpperCase());
+  L.push('               ' + (c.message || ''));
+  if (c.status === 'untested' && c.testedOn) {
+    L.push('               tested releases: ' + c.testedOn.join(', '));
+  }
+  L.push('');
+  L.push('Dependency checks');
+  L.push('-----------------');
+  if (!state.probes.length) {
+    L.push('(not yet run)');
+  } else {
+    state.probes.forEach(function (r) {
+      L.push((r.ok ? '[ ok ] ' : '[FAIL] ') +
+             (r.name + '            ').slice(0, 13) + ' ' + r.detail);
+    });
+  }
+  L.push('');
+  L.push('Runtime state');
+  L.push('-------------');
+  L.push('configured:     ' + !!state.config);
+  L.push('sonos model:    ' + ((state.config && state.config.sonosModel) || 'n/a'));
+  L.push('subscribed:     ' + !!state.sid);
+  L.push('gena received:  ' + state.genaReceived);
+  L.push('overlay clients:' + (state.wss ? state.wss.clients.size : 0));
+  L.push('TV volume:      ' + state.tvVol);
+  L.push('Sonos volume:   ' + state.sonosVol +
+         '   (expected ' + (state.tvVol === null ? 'n/a' : tvToSonos(state.tvVol)) + ')');
+  L.push('ceiling:        ' + state.maxVolume + ' Sonos / ' + maxTvVol() + ' TV');
+  L.push('transport:      ' + state.transportState);
+  L.push('last key:       ' + (state.lastKeyAt
+    ? Math.round((Date.now() - state.lastKeyAt) / 1000) + 's ago' : 'none'));
+  L.push('');
+  L.push('Event log');
+  L.push('---------');
+  L.push(state.diag ? (state.diag.read() || '(empty)') : '(unavailable)');
+
+  return maskIps(L.join('\n'));
+}
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -206,7 +283,26 @@ function startApiServer() {
         wsClients:    state.wss ? state.wss.clients.size : 0,
         lastKeyAt:    state.lastKeyAt,
         genaReceived: state.genaReceived,
+        platform:     state.platform,
+        compat:       state.compat,
+        probes:       state.probes,
+        tvIp:         detectLanIp(),
       }));
+      return;
+    }
+
+    // Plain text so it can be opened in a browser and saved straight to a file.
+    if (url === '/api/diagnostics' && req.method === 'GET') {
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Content-Disposition',
+        'attachment; filename="sonos-overlay-diagnostics.txt"');
+      res.end(buildDiagnosticsReport());
+      return;
+    }
+
+    if (url === '/api/diagnostics' && req.method === 'DELETE') {
+      if (state.diag) state.diag.clear();
+      res.end(JSON.stringify({ ok: true }));
       return;
     }
 
@@ -324,6 +420,10 @@ async function resolveDevice(config) {
       return { ip: config.sonosIp, port: port };
     } catch (e) {
       console.warn('[resolve] stored IP', config.sonosIp, 'unreachable:', e.message);
+      if (state.diag) {
+        state.diag.info('stored Sonos IP unreachable (' + e.message +
+          ') — falling back to discovery');
+      }
     }
   }
 
@@ -447,12 +547,17 @@ async function connectToSonos(config, attempt) {
       console.log('[input] listening on', devPaths.length, 'device(s):', devPaths.join(', '));
       state.inputHandle = openInputDevicesMulti(devPaths, onInputEvent, function(err) {
         console.error('[input] fatal:', err.message);
+        if (state.diag) state.diag.error('input reader fatal: ' + err.message);
       });
     }
 
     console.log('\n[main] ready — press Vol+/Vol−/Mute on the remote.\n');
   } catch (e) {
     console.error('[main] connect failed (attempt ' + (attempt + 1) + '):', e.message);
+    if (state.diag) {
+      state.diag.change('connect-fail', e.message,
+        'connect to Sonos failed: ' + e.message);
+    }
     var delayMs = Math.min(RETRY_BASE_MS * Math.pow(2, attempt), RETRY_MAX_MS);
     console.log('[main] retrying in', Math.round(delayMs / 1000) + 's');
     state.retryTimer = setTimeout(function() {
@@ -563,6 +668,9 @@ function reconcileTvAndSonos() {
       setSonosVolume(state.device, target).catch(function(e) {
         state.pendingSonosWrite = null;
         console.error('[settle] SetVolume failed:', e.message);
+        if (state.diag) {
+          state.diag.change('setvol-fail', e.message, 'SetVolume failed: ' + e.message);
+        }
       });
     }).catch(function() {});
   });
@@ -707,6 +815,10 @@ function scheduleRenew(device, callbackUrl, negotiatedSeconds) {
         scheduleRenew(device, callbackUrl, sub.negotiatedSeconds);
       } catch (e2) {
         console.error('[gena] re-subscribe failed:', e2.message);
+        if (state.diag) {
+          state.diag.change('resub-fail', e2.message,
+            'GENA re-subscribe failed: ' + e2.message);
+        }
       }
     }
   }, delayMs);
@@ -777,8 +889,71 @@ function pad6(n)   { var s = String(n); while (s.length < 6) s = '0' + s; return
 
 // ---------------------------------------------------------------------------
 // Entry point
+// Reports what the platform supports. Advisory only — nothing here stops the
+// service, because a partial failure (say, no overlay) still leaves volume sync
+// working, and the user is better served by a running service and a clear log.
+function runStartupProbes() {
+  var extra = [];
+
+  // Devices are opened speculatively — only one carries the remote's volume
+  // keys, and which /dev/input/eventN that is shifts between boots. So "open"
+  // is the health signal; "live" only becomes true after a real keypress.
+  var ih   = state.inputHandle;
+  var open = (ih && ih.devices) ? ih.devices.length : 0;
+  var live = (ih && ih.live) ? ih.live().length : 0;
+  extra.push({
+    name:   'input',
+    ok:     open > 0,
+    detail: open
+      ? open + ' device(s) open, ' + live + ' producing events' +
+        (live ? '' : ' (normal until a volume key is pressed)')
+      : 'no input devices opened — remote volume keys will not be seen'
+  });
+
+  extra.push({
+    name:   'sonos',
+    ok:     !!state.device,
+    detail: state.device
+      ? 'connected to ' + ((state.config && state.config.sonosModel) || 'player')
+      : 'no player connected'
+  });
+
+  compatLib.runProbes(extra, function (results) {
+    state.probes = results;
+    var failed = results.filter(function (r) { return !r.ok; });
+    results.forEach(function (r) {
+      state.diag.write(r.ok ? 'info' : 'warn',
+        'probe ' + r.name + ': ' + (r.ok ? 'ok' : 'FAILED') + ' — ' + r.detail);
+    });
+    if (failed.length) {
+      console.warn('[compat] ' + failed.length + ' dependency check(s) failed: ' +
+        failed.map(function (r) { return r.name; }).join(', ') +
+        ' — see the Diagnostics screen in the Setup app.');
+    } else {
+      console.log('[compat] all dependency checks passed.');
+    }
+  });
+}
+
 // ---------------------------------------------------------------------------
 async function main() {
+  state.diag     = new diagLib.DiagLog(DIAG_FILE);
+  state.platform = compatLib.readPlatform();
+  state.compat   = compatLib.checkPlatform(state.platform);
+
+  state.diag.info('--- service start, v' + pkg.version + ' ---');
+  state.diag.info('platform: webOS ' + (state.platform.release || 'unknown') +
+    ' on ' + (state.platform.model || 'unknown model') +
+    ', node ' + state.platform.node);
+  state.diag.write(state.compat.status === 'tested' ? 'info' : 'warn',
+    'compatibility: ' + state.compat.status + ' — ' + state.compat.message);
+
+  console.log('[compat] ' + state.compat.message);
+  if (state.compat.status !== 'tested') {
+    console.warn('[compat] This build is not blocked from running. If something ' +
+      'misbehaves, open the Setup app and save the diagnostics report.');
+  }
+
   openPorts();
 
   // Start infrastructure servers first
@@ -800,6 +975,7 @@ async function main() {
   }
 
   startPeriodicSync();
+  runStartupProbes();
 
   process.on('SIGINT',  shutdown);
   process.on('SIGTERM', shutdown);
@@ -807,5 +983,6 @@ async function main() {
 
 main().catch(function(err) {
   console.error('[fatal]', err.message);
+  if (state.diag) state.diag.error('fatal: ' + err.message);
   process.exit(1);
 });
