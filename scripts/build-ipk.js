@@ -7,6 +7,7 @@ var cp   = require('child_process');
 
 var ROOT     = path.join(__dirname, '..');
 var DIST_DIR = path.join(ROOT, 'dist');
+var PKG      = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 
 if (!fs.existsSync(DIST_DIR)) fs.mkdirSync(DIST_DIR);
 
@@ -69,7 +70,7 @@ function arHeader(name, size) {
 function buildIpk(outPath, packageId, description, dataEntries) {
   var control = [
     'Package: ' + packageId,
-    'Version: 1.0.0',
+    'Version: ' + PKG.version,
     'Section: misc',
     'Priority: optional',
     'Architecture: all',
@@ -108,7 +109,14 @@ var appEntries = [tarEntry('./', null)];
 appEntries.push(tarEntry(APP_DIR, null));
 ['appinfo.json', 'index.html', 'icon.png'].forEach(function(f) {
   var full = path.join(ROOT, 'setup', f);
-  if (fs.existsSync(full)) appEntries.push(tarEntry(APP_DIR + f, fs.readFileSync(full)));
+  if (!fs.existsSync(full)) return;
+  var body = fs.readFileSync(full);
+  if (f === 'appinfo.json') {
+    var info = JSON.parse(body.toString('utf8'));
+    info.version = PKG.version;
+    body = Buffer.from(JSON.stringify(info, null, 2) + String.fromCharCode(10), 'utf8');
+  }
+  appEntries.push(tarEntry(APP_DIR + f, body));
 });
 appEntries.push(tarEntry(APP_DIR + 'start-service.sh', fs.readFileSync(path.join(ROOT, 'setup', 'start-service.sh')), 0o755));
 appEntries.push(tarEntry(APP_DIR + 'tv-service.bundle.js', fs.readFileSync(BUNDLE)));
