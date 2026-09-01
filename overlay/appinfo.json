@@ -1,0 +1,17 @@
+{
+  "id": "com.sjbayer.sonosoverlay",
+  "version": "1.0.0",
+  "vendor": "sjbayer",
+  "type": "web",
+  "main": "index.html",
+  "title": "Sonos Volume",
+  "icon": "icon.png",
+  "largeIcon": "icon.png",
+  "transparent": true,
+  "noSplashOnLaunch": true,
+  "handlesRelaunch": true,
+  "defaultWindowType": "floating",
+  "disableBackHistoryAPI": true,
+  "visible": false,
+  "enableKeyboard": false
+}

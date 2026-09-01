@@ -1,0 +1,14 @@
+{
+  "id": "com.brineandbuild.sonosoverlay",
+  "version": "1.0.0",
+  "vendor": "BrineAndBuild",
+  "type": "web",
+  "main": "index.html",
+  "title": "Sonos Overlay",
+  "icon": "icon.png",
+  "largeIcon": "icon.png",
+  "transparent": false,
+  "noSplashOnLaunch": true,
+  "handlesRelaunch": true,
+  "disableBackHistoryAPI": true
+}

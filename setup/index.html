@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1920">
+<title>Sonos Overlay Setup</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+
+html, body {
+  width:1920px; height:1080px;
+  background:#111; color:#fff;
+  font-family: Arial, 'LG Display', sans-serif;
+  overflow:hidden;
+}
+
+/* ── Layout ── */
+#app {
+  display:flex; flex-direction:column;
+  width:100%; height:100%;
+  padding:60px 120px;
+}
+
+header {
+  display:flex; align-items:center; gap:24px;
+  margin-bottom:48px;
+}
+
+header h1 { font-size:36px; font-weight:700; color:#fff; }
+header span { font-size:22px; color:#888; }
+
+#steps {
+  display:flex; gap:12px; margin-bottom:56px;
+}
+.step-dot {
+  width:12px; height:12px; border-radius:50%;
+  background:#333; transition:background 0.3s;
+}
+.step-dot.active   { background:#E8A430; }
+.step-dot.done     { background:#4CAF50; }
+
+#screen-area { flex:1; display:flex; align-items:center; }
+
+.screen { display:none; width:100%; }
+.screen.active { display:block; }
+
+/* ── Cards ── */
+.card {
+  background:#1e1e1e; border-radius:20px;
+  padding:48px 56px; max-width:1100px;
+}
+
+h2 { font-size:48px; font-weight:700; margin-bottom:16px; line-height:1.15; }
+.subtitle { font-size:26px; color:#999; margin-bottom:40px; line-height:1.4; }
+.note { font-size:22px; color:#777; margin-top:32px; line-height:1.5; }
+.note.warn { color:#E8A430; }
+.note.error { color:#e74c3c; }
+.note.ok    { color:#4CAF50; }
+
+/* ── Device list ── */
+#device-list { margin-bottom:32px; }
+
+.device-item {
+  display:flex; align-items:center;
+  background:#2a2a2a; border-radius:12px;
+  padding:24px 32px; margin-bottom:16px;
+  cursor:pointer; border:2px solid transparent;
+  transition:border-color 0.2s, background 0.2s;
+}
+.device-item:hover, .device-item:focus { outline:none; border-color:#E8A430; background:#333; }
+.device-item.selected { border-color:#E8A430; background:#2d2410; }
+.device-name { font-size:30px; font-weight:600; flex:1; }
+.device-meta { font-size:20px; color:#888; }
+
+/* ── Manual entry ── */
+#manual-section { margin-top:32px; }
+.manual-label { font-size:22px; color:#888; margin-bottom:12px; }
+#ip-row { display:flex; gap:16px; align-items:center; }
+#ip-input {
+  flex:1; max-width:420px;
+  background:#2a2a2a; border:2px solid #444; border-radius:10px;
+  padding:18px 24px; font-size:28px; color:#fff; font-family:inherit;
+  outline:none; transition:border-color 0.2s;
+}
+#ip-input:focus { border-color:#E8A430; }
+#ip-input::placeholder { color:#555; }
+
+/* ── Buttons ── */
+.btn-row { display:flex; gap:20px; margin-top:48px; align-items:center; }
+
+.btn {
+  padding:20px 48px; border-radius:12px; border:none;
+  font-size:26px; font-weight:600; font-family:inherit;
+  cursor:pointer; transition:background 0.2s, opacity 0.2s;
+}
+.btn-primary { background:#E8A430; color:#111; }
+.btn-primary:hover { background:#f0b840; }
+.btn-secondary { background:#2a2a2a; color:#ccc; border:2px solid #444; }
+.btn-secondary:hover { background:#333; }
+.btn-ghost { background:transparent; color:#888; border:2px solid #333; }
+.btn-ghost:hover { color:#ccc; border-color:#555; }
+.btn:disabled { opacity:0.4; cursor:default; }
+
+/* ── Spinner ── */
+.spinner {
+  width:48px; height:48px; border-radius:50%;
+  border:5px solid #333; border-top-color:#E8A430;
+  animation:spin 0.8s linear infinite; display:inline-block;
+}
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* ── Test pulse ── */
+#key-pulse {
+  width:80px; height:80px; border-radius:50%;
+  background:#333; display:inline-flex; align-items:center;
+  justify-content:center; font-size:36px;
+  transition:background 0.15s, transform 0.15s;
+  margin-right:24px; vertical-align:middle;
+}
+#key-pulse.lit { background:#E8A430; transform:scale(1.15); }
+
+/* ── Progress bar ── */
+#scan-bar-wrap { height:6px; background:#333; border-radius:3px; margin-bottom:32px; overflow:hidden; }
+#scan-bar { height:100%; width:0%; background:#E8A430; border-radius:3px; transition:width 0.1s linear; }
+
+/* ── Done check ── */
+.big-check { font-size:96px; margin-bottom:24px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>Sonos Volume Overlay</h1>
+    <span>Setup</span>
+  </header>
+
+  <div id="steps">
+    <div class="step-dot" id="dot-0"></div>
+    <div class="step-dot" id="dot-1"></div>
+    <div class="step-dot" id="dot-2"></div>
+    <div class="step-dot" id="dot-3"></div>
+    <div class="step-dot" id="dot-4"></div>
+  </div>
+
+  <div id="screen-area">
+
+    <!-- Step 0: Starting service -->
+    <div class="screen active" id="s0">
+      <div class="card">
+        <h2>Starting up…</h2>
+        <div class="subtitle">Launching background service. This takes a few seconds.</div>
+        <div class="spinner" id="start-spinner"></div>
+        <div class="note" id="start-note"></div>
+      </div>
+    </div>
+
+    <!-- Step 1: Scan -->
+    <div class="screen" id="s1">
+      <div class="card">
+        <h2>Finding your Sonos</h2>
+        <div class="subtitle">Scanning your network for Sonos devices…</div>
+        <div id="scan-bar-wrap"><div id="scan-bar"></div></div>
+        <div id="device-list"></div>
+
+        <div id="manual-section">
+          <div class="manual-label" id="manual-label">Or enter the Sonos IP address manually:</div>
+          <div id="ip-row">
+            <input id="ip-input" type="text" placeholder="192.168.1.x" maxlength="15" />
+            <button class="btn btn-secondary" onclick="useManualIp()">Use this IP</button>
+          </div>
+          <div class="note warn" id="network-note" style="display:none">
+            ⚠ No devices found. Make sure your Sonos and TV are on the same Wi-Fi network.
+            Enter the Sonos IP from the Sonos app (Settings → System → About My System).
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <button class="btn btn-primary" id="btn-rescan" onclick="startScan()">Scan Again</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 2: Test connection -->
+    <div class="screen" id="s2">
+      <div class="card">
+        <h2>Testing connection…</h2>
+        <div class="subtitle" id="test-subtitle">Connecting to <span id="test-ip">—</span></div>
+        <div class="spinner" id="test-spinner"></div>
+        <div class="note" id="test-note"></div>
+        <div class="btn-row" id="test-btns" style="display:none">
+          <button class="btn btn-ghost" onclick="goTo(1)">← Back</button>
+          <button class="btn btn-primary" id="btn-retry-test" onclick="runTest()">Try Again</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 3: Remote test (CEC/ARC) -->
+    <div class="screen" id="s3">
+      <div class="card">
+        <h2>Test your remote</h2>
+        <div class="subtitle">
+          Press <strong>Vol+</strong> or <strong>Vol−</strong> on your remote.
+          This confirms HDMI-ARC is working.
+        </div>
+
+        <div style="margin:32px 0; font-size:28px;">
+          <span id="key-pulse">🔊</span>
+          <span id="key-status">Waiting for a button press…</span>
+        </div>
+
+        <div class="note warn" id="arc-warn" style="display:none">
+          ⚠ No key presses detected after 15 seconds.<br>
+          Check: TV Settings → Sound → Sound Out → HDMI ARC, and ensure CEC is enabled.
+          You can skip this step if ARC was working before.
+        </div>
+
+        <div class="btn-row">
+          <button class="btn btn-ghost" id="btn-skip-arc" onclick="finishSetup()">Skip &amp; Finish</button>
+          <button class="btn btn-primary" id="btn-arc-done" onclick="finishSetup()" style="display:none">
+            Looks good — Finish ✓
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Step 4: Done -->
+    <div class="screen" id="s4">
+      <div class="card">
+        <div class="big-check">✅</div>
+        <h2>All set!</h2>
+        <div class="subtitle">
+          Sonos Volume Overlay is running.<br>
+          Press Vol+ or Vol− anytime to see the volume.
+        </div>
+        <div class="note ok" id="done-details"></div>
+        <div class="note" style="margin-top:24px;font-size:18px;color:#555;">
+          Support: p0txecpth@gmail.com
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-primary" onclick="closeApp()">Close Setup</button>
+          <button class="btn btn-secondary" onclick="goTo(1)">Reconfigure</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+var API    = 'http://localhost:7476';
+var HBC    = 'luna://org.webosbrew.hbchannel.service/exec';
+var APP_DIR = '/media/developer/apps/usr/palm/applications/com.brineandbuild.sonosoverlay';
+
+var currentStep   = 0;
+var selectedIp    = null;
+var selectedName  = null;
+var selectedPort  = 1400;
+var arcDetected   = false;
+var arcTimer      = null;
+var arcPollTimer  = null;
+var scanBarTimer  = null;
+var lastKeyAt     = 0;
+
+// ── PalmServiceBridge helpers ──────────────────────────────────────────────
+function lunaCall(uri, params) {
+  return new Promise(function(resolve, reject) {
+    if (!window.PalmServiceBridge) { reject(new Error('PalmServiceBridge unavailable')); return; }
+    var b = new PalmServiceBridge();
+    b.onservicecallback = function(msg) {
+      try { var r = JSON.parse(msg); resolve(r); }
+      catch(e) { reject(e); }
+    };
+    b.call(uri, JSON.stringify(params || {}));
+  });
+}
+
+function hbcExec(command) {
+  return lunaCall(HBC, { command: command });
+}
+
+// ── Fetch helpers ──────────────────────────────────────────────────────────
+function apiGet(path) {
+  return fetch(API + path).then(function(r) { return r.json(); });
+}
+function apiPost(path, body) {
+  return fetch(API + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }).then(function(r) { return r.json(); });
+}
+
+// ── Screen navigation ──────────────────────────────────────────────────────
+function goTo(step) {
+  document.querySelectorAll('.screen').forEach(function(s) { s.classList.remove('active'); });
+  document.getElementById('s' + step).classList.add('active');
+  currentStep = step;
+  for (var i = 0; i < 5; i++) {
+    var dot = document.getElementById('dot-' + i);
+    dot.className = 'step-dot' + (i < step ? ' done' : (i === step ? ' active' : ''));
+  }
+}
+
+// ── Step 0: Start service ──────────────────────────────────────────────────
+function startService() {
+  var note = document.getElementById('start-note');
+  note.textContent = '';
+
+  // Try API first — service may already be running
+  apiGet('/api/status').then(function(s) {
+    if (s.ok) { onServiceReady(s); return; }
+    throw new Error('not ready');
+  }).catch(function() {
+    note.textContent = 'Launching service…';
+    var cmd = 'sh ' + APP_DIR + '/start-service.sh';
+    hbcExec(cmd).then(function() {
+      pollForService(0);
+    }).catch(function(e) {
+      note.className = 'note error';
+      note.textContent = 'Could not start service. Make sure Homebrew Channel is installed. (' + e.message + ')';
+    });
+  });
+}
+
+function pollForService(attempts) {
+  var note = document.getElementById('start-note');
+  if (attempts > 20) {
+    note.className = 'note error';
+    note.textContent = 'Service did not start. Check /var/log/sonos-overlay.log for errors.';
+    return;
+  }
+  setTimeout(function() {
+    apiGet('/api/status').then(function(s) {
+      if (s.ok) { onServiceReady(s); }
+      else      { pollForService(attempts + 1); }
+    }).catch(function() { pollForService(attempts + 1); });
+  }, 1000);
+}
+
+function onServiceReady(status) {
+  // Tell the overlay to hide so it doesn't intercept cursor input during setup
+  apiPost('/api/setup-mode', {}).catch(function() {});
+
+  if (status.configured && status.connected) {
+    // Already working — jump to ARC test
+    selectedIp   = status.sonosIp;
+    selectedName = status.sonosName || status.sonosIp;
+    goTo(3);
+    startArcPoll();
+  } else {
+    goTo(1);
+    startScan();
+  }
+}
+
+// ── Step 1: Scan ──────────────────────────────────────────────────────────
+function startScan() {
+  document.getElementById('device-list').innerHTML = '';
+  document.getElementById('network-note').style.display = 'none';
+  document.getElementById('manual-label').textContent = 'Or enter the Sonos IP address manually:';
+  document.getElementById('btn-rescan').disabled = true;
+  document.getElementById('btn-rescan').textContent = 'Scanning…';
+
+  // Animate the bar over 5s
+  var bar = document.getElementById('scan-bar'), pct = 0;
+  clearInterval(scanBarTimer);
+  bar.style.width = '0%';
+  scanBarTimer = setInterval(function() {
+    pct = Math.min(pct + 2, 95);
+    bar.style.width = pct + '%';
+  }, 100);
+
+  apiGet('/api/scan').then(function(res) {
+    clearInterval(scanBarTimer);
+    document.getElementById('scan-bar').style.width = '100%';
+    document.getElementById('btn-rescan').disabled = false;
+    document.getElementById('btn-rescan').textContent = 'Scan Again';
+
+    var list = document.getElementById('device-list');
+    if (!res.devices || res.devices.length === 0) {
+      document.getElementById('network-note').style.display = 'block';
+      document.getElementById('manual-label').textContent = 'Enter the Sonos IP manually:';
+    } else {
+      res.devices.forEach(function(dev) {
+        var el = document.createElement('div');
+        el.className = 'device-item';
+        el.tabIndex  = 0;
+        el.innerHTML =
+          '<span class="device-name">' + esc(dev.name) + '</span>' +
+          '<span class="device-meta">' + esc(dev.ip) + (dev.model ? ' · ' + esc(dev.model) : '') + '</span>';
+        el.onclick = function() { selectDevice(dev, el); };
+        el.onkeydown = function(e) { if (e.key === 'Enter') selectDevice(dev, el); };
+        list.appendChild(el);
+      });
+    }
+  }).catch(function() {
+    clearInterval(scanBarTimer);
+    document.getElementById('btn-rescan').disabled = false;
+    document.getElementById('btn-rescan').textContent = 'Scan Again';
+    document.getElementById('network-note').style.display = 'block';
+  });
+}
+
+function selectDevice(dev, el) {
+  document.querySelectorAll('.device-item').forEach(function(e) { e.classList.remove('selected'); });
+  el.classList.add('selected');
+  selectedIp   = dev.ip;
+  selectedPort = dev.port || 1400;
+  selectedName = dev.name;
+  goTo(2);
+  runTest();
+}
+
+function useManualIp() {
+  var ip = document.getElementById('ip-input').value.trim();
+  if (!ip) return;
+  selectedIp   = ip;
+  selectedPort = 1400;
+  selectedName = ip;
+  goTo(2);
+  runTest();
+}
+
+// ── Step 2: Test connection ────────────────────────────────────────────────
+function runTest() {
+  document.getElementById('test-ip').textContent = selectedIp;
+  document.getElementById('test-spinner').style.display = 'inline-block';
+  document.getElementById('test-note').textContent = '';
+  document.getElementById('test-btns').style.display = 'none';
+
+  apiPost('/api/test', { sonosIp: selectedIp, sonosPort: selectedPort })
+    .then(function(res) {
+      document.getElementById('test-spinner').style.display = 'none';
+      if (res.ok) {
+        document.getElementById('test-note').className = 'note ok';
+        document.getElementById('test-note').textContent = '✓ Connected! Volume is currently ' + res.volume + '.';
+        // Save config then continue
+        apiPost('/api/config', {
+          sonosIp:   selectedIp,
+          sonosPort: selectedPort,
+          sonosName: selectedName
+        }).then(function() {
+          setTimeout(function() { goTo(3); startArcPoll(); }, 800);
+        });
+      } else {
+        document.getElementById('test-note').className = 'note error';
+        document.getElementById('test-note').textContent =
+          '✗ Could not connect: ' + (res.error || 'unknown error') + '\n' +
+          'Check the IP address and ensure your TV and Sonos are on the same network.';
+        document.getElementById('test-btns').style.display = 'flex';
+      }
+    }).catch(function(e) {
+      document.getElementById('test-spinner').style.display = 'none';
+      document.getElementById('test-note').className = 'note error';
+      document.getElementById('test-note').textContent = 'Request failed: ' + e.message;
+      document.getElementById('test-btns').style.display = 'flex';
+    });
+}
+
+// ── Step 3: ARC test ──────────────────────────────────────────────────────
+function startArcPoll() {
+  arcDetected = false;
+  lastKeyAt   = 0;
+  clearTimeout(arcTimer);
+  clearInterval(arcPollTimer);
+
+  document.getElementById('key-status').textContent = 'Waiting for a button press…';
+  document.getElementById('arc-warn').style.display = 'none';
+  document.getElementById('btn-arc-done').style.display = 'none';
+  document.getElementById('btn-skip-arc').style.display = 'inline-block';
+
+  // Poll status for key events
+  arcPollTimer = setInterval(function() {
+    apiGet('/api/status').then(function(s) {
+      if (s.lastKeyAt && s.lastKeyAt > lastKeyAt) {
+        lastKeyAt = s.lastKeyAt;
+        arcDetected = true;
+        pulse();
+        document.getElementById('key-status').textContent = 'Key press detected! HDMI-ARC is working. ✓';
+        document.getElementById('key-status').style.color = '#4CAF50';
+        document.getElementById('btn-arc-done').style.display = 'inline-block';
+        clearInterval(arcPollTimer);
+        clearTimeout(arcTimer);
+      }
+    }).catch(function() {});
+  }, 400);
+
+  // Timeout after 15s
+  arcTimer = setTimeout(function() {
+    if (!arcDetected) {
+      clearInterval(arcPollTimer);
+      document.getElementById('arc-warn').style.display = 'block';
+    }
+  }, 15000);
+}
+
+function pulse() {
+  var el = document.getElementById('key-pulse');
+  el.classList.add('lit');
+  setTimeout(function() { el.classList.remove('lit'); }, 200);
+}
+
+// ── Step 4: Finish ────────────────────────────────────────────────────────
+function finishSetup() {
+  clearTimeout(arcTimer);
+  clearInterval(arcPollTimer);
+
+  // Write startup hook
+  apiPost('/api/startup-hook', {}).then(function(res) {
+    var details = document.getElementById('done-details');
+    if (res.ok) {
+      details.textContent = 'Auto-start configured. The overlay will launch automatically on each boot.';
+    } else {
+      details.className = 'note warn';
+      details.textContent = 'Note: Auto-start could not be configured (' + res.error + '). You may need to relaunch manually after a reboot.';
+    }
+  });
+
+  // Do NOT launch overlay here — it would block input on this screen.
+  // Overlay launches when the user presses Close Setup.
+  goTo(4);
+}
+
+function closeApp() {
+  if (window.PalmSystem) window.PalmSystem.hide();
+  else window.close();
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+if (window.PalmSystem) {
+  window.PalmSystem.stageReady();
+}
+
+// Nothing to pre-close — native OSD handles volume display, no separate overlay app
+
+startService();
+</script>
+</body>
+</html>

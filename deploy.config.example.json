@@ -1,0 +1,6 @@
+{
+  "tvIp": "192.168.1.10",
+  "tvUser": "root",
+  "sshKey": "~/.ssh/id_lgtv",
+  "appId": "com.brineandbuild.sonosoverlay"
+}

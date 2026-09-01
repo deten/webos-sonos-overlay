@@ -1,0 +1,25 @@
+{
+  "name": "webos-sonos-overlay",
+  "version": "0.5.0",
+  "description": "Sonos volume sync and on-screen volume indicator for webOS LG TVs",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "build:tv": "esbuild tv-service.js --bundle --platform=node --target=node8 --external:bufferutil --external:utf-8-validate --outfile=dist/tv-service.bundle.js",
+    "build-ipk": "npm run build:tv && node scripts/build-ipk.js",
+    "release": "node scripts/release.js",
+    "open-ports": "node scripts/deploy.js open-ports",
+    "deploy": "node scripts/deploy.js service",
+    "deploy-ipk": "node scripts/deploy.js ipk",
+    "run-tv": "node scripts/deploy.js run",
+    "launch-overlay": "node scripts/deploy.js launch"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.7.2",
+    "node-ssdp": "^4.0.1",
+    "ws": "^6.2.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

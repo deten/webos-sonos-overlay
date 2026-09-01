@@ -1,0 +1,5 @@
+node_modules/
+dist/
+deploy.config.json
+NEXT-STEPS.md
+.ssh/
