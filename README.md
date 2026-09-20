@@ -251,6 +251,12 @@ say it works if you are reporting a TV that is not in the table yet.
 **Network addresses are masked** (`192.168.x.x`), and the report deliberately
 reads no serial number, device id, or MAC address.
 
+For an intermittent fault, press **Clear** on the Diagnostics screen first, use
+the TV normally for a day or two, then save the report after it happens again.
+The report opens with a totals block covering everything since that clear, and
+a short list of notable events, so a capture spanning several days can be read
+without going through the whole log.
+
 ## Configuration
 
 Written by the setup app to `/var/lib/com.brineandbuild.sonosoverlay/config.json`:

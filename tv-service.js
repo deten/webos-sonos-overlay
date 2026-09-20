@@ -14,6 +14,7 @@ var inputLib = require('./lib/input');
 var corrLib  = require('./lib/correlator');
 var compatLib = require('./lib/compat');
 var diagLib   = require('./lib/diaglog');
+var statsLib  = require('./lib/stats');
 var pkg       = require('./package.json');
 
 var startListener         = genaLib.startListener;
@@ -55,7 +56,21 @@ var OVERLAY_APPLY_SH =
   '  systemctl restart surface-manager-daemon.service 2>/dev/null\n' +
   'fi\n';
 // Persistent, unlike /var/log which is a ramfs and is wiped on every boot.
-var DIAG_FILE   = CONFIG_DIR + '/diagnostics.log';
+var DIAG_FILE    = CONFIG_DIR + '/diagnostics.log';
+var NOTABLE_FILE = CONFIG_DIR + '/notable.log';
+var STATS_FILE   = CONFIG_DIR + '/stats.json';
+
+// How long after our own SetVolume the Arc is still expected to be catching
+// up. Anything it reports inside this window is our doing, not a person.
+var WRITE_ECHO_MS = 4000;
+
+// A player that has stopped answering this quickly is worth recording.
+var SLOW_PLAYER_MS = 1500;
+
+// How long the session heartbeat waits between writes. It exists so the next
+// run can tell roughly when this one stopped, which a killed process cannot
+// record for itself.
+var HEARTBEAT_MS = 60000;
 
 // Connect retry backoff. The TV cold-boots on every power-on, so the service
 // always races Wi-Fi association and DHCP; a single attempt is not enough.
@@ -127,6 +142,17 @@ var state = {
   settleTimer:     null,
   transportState:  null,
   holding:         false,
+
+  // Instrumentation. None of this changes behaviour; it exists so a report
+  // from someone else's TV can be read without guessing.
+  notable:       null,   // rare entries, kept whatever else fills the log
+  stats:         null,   // counters and the session record, across reboots
+  burst:         null,   // the keypress burst in progress
+  lastWriteAt:   0,      // when we last issued a SetVolume
+  lastWriteVal:  null,   // what we asked for
+  lastGenaAt:    0,      // when the player last told us anything
+  genaCount:     0,      // events this session, for spotting a silent player
+  pollGenaMark:  0,      // genaCount as of the previous poll
 };
 
 // ---------------------------------------------------------------------------
@@ -139,6 +165,88 @@ function maskIps(text) {
   return String(text).replace(
     /\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g,
     function (m, a, b) { return a + '.' + b + '.x.x'; });
+}
+
+// ---------------------------------------------------------------------------
+// Instrumentation helpers.
+// detail() is the running commentary. note() is for the handful of entries
+// that must survive two days of it, and goes to both files so the detail log
+// still reads in order.
+// ---------------------------------------------------------------------------
+function detail(msg, level) {
+  if (state.diag) state.diag.write(level || 'info', msg);
+}
+
+function note(msg, level) {
+  if (state.notable) state.notable.write(level || 'warn', msg);
+  if (state.diag)    state.diag.write(level || 'warn', msg);
+}
+
+function bump(key, by) { if (state.stats) state.stats.bump(key, by); }
+function peak(key, v)  { if (state.stats) state.stats.max(key, v); }
+
+function agoMs(t) { return t ? (Date.now() - t) : null; }
+function agoStr(t) {
+  var ms = agoMs(t);
+  return ms === null ? 'never' : (ms < 10000 ? ms + 'ms' : Math.round(ms / 1000) + 's');
+}
+
+// What the last run left behind. A process killed by a power cut cannot
+// record its own ending, so the heartbeat it wrote while alive is the closest
+// we get to knowing when the TV went off and whether it shut down properly.
+function reportPreviousSession(prev) {
+  state.prevSession = prev && prev.sid ? prev : null;
+  if (!prev || !prev.startedAt) return;
+
+  var endedAgo = prev.lastSeenAt
+    ? Math.round((Date.now() - Date.parse(prev.lastSeenAt)) / 1000) : null;
+
+  if (prev.cleanExit) {
+    bump('clean_exits');
+    detail('previous session ended cleanly at ' + (prev.exitAt || prev.lastSeenAt));
+  } else {
+    bump('unclean_exits');
+    note('previous session did not shut down cleanly. Last heartbeat ' +
+         (prev.lastSeenAt || 'unknown') +
+         (endedAgo === null ? '' : ', about ' + endedAgo + 's ago') +
+         '. Its subscription may still be held by the player.');
+  }
+}
+
+// Cancel anything the previous run left on the player, and record whether it
+// was still there. This is the one question a log from another house cannot
+// otherwise answer: does a power cut really strand a subscription?
+async function probeStaleSubscription(device) {
+  var prev = state.prevSession;
+  if (!prev || !prev.sid) return;
+  state.prevSession = null;   // once per run
+
+  var heldFor = prev.lastSeenAt
+    ? Math.round((Date.now() - Date.parse(prev.lastSeenAt)) / 1000) : null;
+
+  try {
+    var res = await genaLib.unsubscribeStatus(device, prev.sid, EVENT_PATH);
+    if (res.statusCode === 200) {
+      bump('stale_subs_alive');
+      note('STALE SUB: the player was still holding the previous run\'s ' +
+           'subscription' +
+           (heldFor === null ? '' : ', ' + heldFor + 's after that run stopped') +
+           '. Cancelled it now. For that whole gap the player still had this ' +
+           'TV listed as a subscriber and was posting events to it.');
+    } else {
+      detail('previous subscription already released (HTTP ' + res.statusCode + ')');
+    }
+  } catch (e) {
+    detail('stale subscription probe failed: ' + e.message, 'warn');
+  }
+}
+
+// Written while alive so the next run can see roughly when this one stopped.
+function startHeartbeat() {
+  setInterval(function () {
+    if (!state.stats) return;
+    state.stats.setSession({ lastSeenAt: new Date().toISOString() }, true);
+  }, HEARTBEAT_MS);
 }
 
 function refreshPlatform() {
@@ -205,12 +313,69 @@ function buildDiagnosticsReport() {
   L.push('transport:      ' + state.transportState);
   L.push('last key:       ' + (state.lastKeyAt
     ? Math.round((Date.now() - state.lastKeyAt) / 1000) + 's ago' : 'none'));
+  L.push('last event:     ' + (state.lastGenaAt
+    ? Math.round((Date.now() - state.lastGenaAt) / 1000) + 's ago' : 'none this session'));
+  L.push('');
+  summaryLines().forEach(function (s) { L.push(s); });
+  L.push('');
+  L.push('Notable events');
+  L.push('--------------');
+  L.push(state.notable ? (state.notable.read() || '(none)') : '(unavailable)');
   L.push('');
   L.push('Event log');
   L.push('---------');
   L.push(state.diag ? (state.diag.read() || '(empty)') : '(unavailable)');
 
   return maskIps(L.join('\n'));
+}
+
+// Counts covering every session since the counters were last cleared, so a
+// capture spanning several days can be triaged before reading any of the log.
+function summaryLines() {
+  var L = [];
+  L.push('Totals since ' + (state.stats ? state.stats.since() : 'n/a'));
+  L.push('-----------------------------------------');
+  if (!state.stats) { L.push('(unavailable)'); return L; }
+
+  var c = state.stats.counters();
+  function n(k) { return c[k] || 0; }
+  function row(label, value, note) {
+    L.push((label + '                        ').slice(0, 24) + value +
+           (note ? '   ' + note : ''));
+  }
+
+  row('sessions',        n('sessions'));
+  row('clean shutdowns', n('clean_exits'),
+      n('sessions') > 1 ? '(of ' + (n('sessions') - 1) + ' ended)' : '');
+  row('stale subs found', n('stale_subs_alive'),
+      'subscriptions the player still held at the next start');
+  L.push('');
+  row('key bursts',      n('bursts'));
+  row('keys pressed',    n('keys'));
+  row('corrections',     n('corrections'),  'volume writes we sent the player');
+  row('correction miss', n('correction_missed'),
+      'writes where the player did not end up where asked');
+  row('adoptions',       n('adoptions'),    'external changes pulled into the TV');
+  row('  while pending', n('adoptions_while_pending'),
+      'adopted while our own correction was still settling');
+  L.push('');
+  row('events received', n('events'));
+  row('event gaps',      n('event_gaps'),
+      'player volume moved with no event sent');
+  row('longest gap',     n('max_gena_gap_s') + 's',
+      'between events while the TV was awake');
+  row('renew failures',  n('renew_failures'));
+  row('resubscribes',    n('resubscribes'));
+  row('slow responses',  n('slow_player'),  'over ' + SLOW_PLAYER_MS + 'ms');
+  row('slowest response', n('max_player_ms') + 'ms');
+
+  var prev = state.stats.prevSession();
+  if (prev && prev.lastSeenAt) {
+    L.push('');
+    L.push('previous session: last heartbeat ' + prev.lastSeenAt +
+           ', exit ' + (prev.cleanExit ? 'clean' : 'not recorded'));
+  }
+  return L;
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +501,9 @@ function startApiServer() {
     }
 
     if (url === '/api/diagnostics' && req.method === 'DELETE') {
-      if (state.diag) state.diag.clear();
+      if (state.diag)    state.diag.clear();
+      if (state.notable) state.notable.clear();
+      if (state.stats)   state.stats.reset();
       res.end(JSON.stringify({ ok: true }));
       return;
     }
@@ -586,9 +753,23 @@ async function connectToSonos(config, attempt) {
       }).catch(function() {});
     }
 
+    // Before taking a new subscription, clear any the last run left behind,
+    // and record whether the player was still holding it.
+    await probeStaleSubscription(device);
+
     var sub = await subscribe(device, callbackUrl, EVENT_PATH, REQUESTED_TIMEOUT);
     state.sid = sub.sid;
     console.log('[gena] subscribed SID:', sub.sid, '| negotiated:', sub.negotiatedSeconds + 's');
+    detail('subscribed, timeout ' + sub.negotiatedSeconds + 's (asked for ' +
+           REQUESTED_TIMEOUT + 's)');
+    if (state.stats) {
+      state.stats.setSession({
+        startedAt:  state.stats.session().startedAt || new Date().toISOString(),
+        sid:        sub.sid,
+        lastSeenAt: new Date().toISOString(),
+        cleanExit:  false
+      }, true);
+    }
     scheduleRenew(device, callbackUrl, sub.negotiatedSeconds);
 
     // Input devices (only open once)
@@ -626,6 +807,7 @@ async function connectToSonos(config, attempt) {
 // ---------------------------------------------------------------------------
 function onInputEvent(event) {
   state.lastKeyAt = Date.now();
+  recordKeyInBurst(event);
   var label = event.value === 1 ? 'down  ' : 'repeat';
   console.log('[input]', label, 'dir=' + event.direction,
     '| kernel=' + event.kernelSec + '.' + pad6(event.kernelUsec),
@@ -634,6 +816,49 @@ function onInputEvent(event) {
   // value 1 = discrete press, 2 = auto-repeat from holding the button down.
   state.holding = (event.value === 2);
   onVolumeKey(event.direction);
+}
+
+// A burst is everything from the first press until the settle that follows it.
+// Logging one line per burst rather than per press keeps two days of use
+// readable, and the before and after values on both sides are what show
+// whether a hold behaves differently from single presses.
+function recordKeyInBurst(event) {
+  if (!state.burst) {
+    state.burst = {
+      startedAt: Date.now(),
+      tvBefore:  state.tvVol,
+      arcBefore: state.sonosVol,
+      keys:      0,
+      repeats:   0,
+      dirs:      {}
+    };
+    bump('bursts');
+  }
+  var b = state.burst;
+  b.keys++;
+  if (event.value === 2) b.repeats++;
+  b.dirs[event.direction] = (b.dirs[event.direction] || 0) + 1;
+  b.lastAt = Date.now();
+  bump('keys');
+}
+
+// Called once the burst has settled and any correction has been issued.
+function closeBurst(wrote) {
+  var b = state.burst;
+  if (!b) return;
+  state.burst = null;
+
+  var dirs = Object.keys(b.dirs).map(function (d) {
+    return d + 'x' + b.dirs[d];
+  }).join(' ');
+
+  detail('burst: ' + b.keys + ' key(s) [' + dirs + ']' +
+         (b.repeats ? ' incl ' + b.repeats + ' held' : '') +
+         ' over ' + (b.lastAt - b.startedAt) + 'ms' +
+         ' | TV ' + b.tvBefore + ' -> ' + state.tvVol +
+         ' | Arc ' + b.arcBefore + ' -> ' + state.sonosVol +
+         (wrote === null ? ' | no correction needed'
+                         : ' | corrected Arc to ' + wrote));
 }
 
 // The TV has already drawn its own number by the time this runs; that is the
@@ -666,6 +891,9 @@ function refreshTransportState() {
   getTransportState(state.device).then(function(ts) {
     if (ts && ts !== state.transportState) {
       console.log('[arc] transport state:', state.transportState, '->', ts);
+      // Worth recording: a report of the app showing the wrong thing is much
+      // easier to read against what the player was actually saying at the time.
+      detail('transport: ' + state.transportState + ' -> ' + ts);
     }
     if (ts) state.transportState = ts;
   }).catch(function() {});
@@ -703,30 +931,104 @@ function reconcileTvAndSonos() {
       state.tvVol = tvCap;
     }
 
+    var askedAt = Date.now();
     getVolume(state.device).then(function(sonosVol) {
+      recordPlayerLatency(Date.now() - askedAt);
+      checkForMissedEvent(sonosVol);
+
       state.sonosVol = sonosVol;
       var target = clampVol(tvToSonos(state.tvVol));
-      if (target === sonosVol) return;
+      if (target === sonosVol) { closeBurst(null); return; }
 
       // Never jump the Arc up by a lot in one correction. Going down is always
       // safe so it is unrestricted; the next poll closes any remaining gap.
       if (target > sonosVol + MAX_RAISE_PER_CORRECTION) {
         target = sonosVol + MAX_RAISE_PER_CORRECTION;
         console.warn('[cap] limiting raise to', target, '- TV asked for', state.tvVol);
+        note('raise limited to ' + target + ', TV asked for Arc ' +
+             tvToSonos(state.tvVol), 'warn');
       }
 
       console.log('[settle] TV', state.tvVol, '(wants Arc ' + tvToSonos(state.tvVol) + ')',
         '| Arc', sonosVol, '-> setting Arc to', target);
       state.pendingSonosWrite = target;
+      state.lastWriteAt  = Date.now();
+      state.lastWriteVal = target;
+      bump('corrections');
+      detail('CORRECT: TV ' + state.tvVol + ' wants Arc ' +
+             tvToSonos(state.tvVol) + ', Arc was ' + sonosVol +
+             ', writing ' + target +
+             ' | last key ' + agoStr(state.lastKeyAt));
+      closeBurst(target);
+      verifyWrite(target, sonosVol);
+
       setSonosVolume(state.device, target).catch(function(e) {
         state.pendingSonosWrite = null;
         console.error('[settle] SetVolume failed:', e.message);
+        bump('write_failures');
+        note('SetVolume to ' + target + ' failed: ' + e.message, 'error');
         if (state.diag) {
           state.diag.change('setvol-fail', e.message, 'SetVolume failed: ' + e.message);
         }
       });
-    }).catch(function() {});
+    }).catch(function(e) {
+      recordPlayerLatency(Date.now() - askedAt);
+      bump('read_failures');
+      if (state.diag) {
+        state.diag.change('getvol-fail', e && e.message,
+          'reading the player volume failed: ' + (e && e.message));
+      }
+    });
   });
+}
+
+// A player that has gone slow to answer is a player in trouble, and it is the
+// cheapest health signal we have that does not depend on events arriving.
+function recordPlayerLatency(ms) {
+  peak('max_player_ms', ms);
+  if (ms < SLOW_PLAYER_MS) return;
+  bump('slow_player');
+  if (state.diag) {
+    state.diag.change('slow-player', Math.round(ms / 1000),
+      'the player took ' + ms + 'ms to answer a volume read');
+  }
+}
+
+// The test for a player that has stopped sending events. We poll anyway, so
+// if a poll finds the volume somewhere we were never told about, the event
+// channel is not delivering. That is the difference between the player being
+// quiet because nothing happened and being silent because it is wedged.
+function checkForMissedEvent(polledVol) {
+  var believed  = state.sonosVol;
+  var newEvents = state.genaCount - state.pollGenaMark;
+  state.pollGenaMark = state.genaCount;
+
+  if (believed === null || polledVol === believed) return;
+  if (newEvents > 0) return;   // it did tell us, we simply polled as well
+
+  bump('event_gaps');
+  note('EVENT GAP: player volume moved ' + believed + ' -> ' + polledVol +
+       ' and no event was sent (last event ' + agoStr(state.lastGenaAt) +
+       ', our last write ' + agoStr(state.lastWriteAt) + ')');
+}
+
+// Did the player actually end up where we asked? Skipped when the user has
+// touched the remote since, or when a newer write has superseded this one,
+// because then a mismatch is expected rather than interesting.
+function verifyWrite(target, before) {
+  var writeAt = state.lastWriteAt;
+  setTimeout(function () {
+    if (!state.device) return;
+    if (state.lastWriteAt !== writeAt) return;
+    if (state.lastKeyAt > writeAt) return;
+
+    getVolume(state.device).then(function (v) {
+      if (v === target) return;   // the normal case, and not worth a line
+      bump('correction_missed');
+      note('VERIFY: asked the player for ' + target + ' (it was ' + before +
+           '), ' + Math.round(WRITE_ECHO_MS / 1000) + 's later it is on ' + v);
+    }).catch(function () {});
+  }, WRITE_ECHO_MS);
 }
 
 // GENA is read-only now: it tells us where the Arc is and nothing more, and it
@@ -760,6 +1062,23 @@ function reconcile(genaVol, genaMuted) {
     var adopted = Math.min(sonosToTv(genaVol), maxTvVol());
     console.log('[extern] Arc moved', prev, '->', genaVol,
       'with no keypress, adopting into TV as', adopted);
+
+    // Everything needed to judge afterwards whether this adoption was right.
+    // Two cases look identical here and are not: a person on their phone, and
+    // the player still catching up from presses we just made.
+    var sinceWrite = agoMs(state.lastWriteAt);
+    var stillSettling = sinceWrite !== null && sinceWrite < WRITE_ECHO_MS;
+    bump('adoptions');
+    if (stillSettling) bump('adoptions_while_pending');
+
+    (stillSettling ? note : detail)(
+      'ADOPT: Arc ' + prev + ' -> ' + genaVol + ', TV ' + state.tvVol +
+      ' -> ' + adopted +
+      ' | last key ' + agoStr(state.lastKeyAt) +
+      ' | our last write ' + agoStr(state.lastWriteAt) +
+      (state.lastWriteVal === null ? '' : ' (asked ' + state.lastWriteVal + ')') +
+      (stillSettling ? ' | SUSPECT: our own correction was still settling' : ''));
+
     state.tvVol = adopted;
     pushTvVolume(adopted);
   }
@@ -796,6 +1115,12 @@ function onGenaNotify(headers, rawBody, recvAt) {
 
   if (masterVol !== null || muted !== null) {
     state.genaReceived = true;
+    // Gap between events, measured only while we already had one, so an idle
+    // overnight stretch does not count as the player having gone quiet.
+    if (state.lastGenaAt) peak('max_gena_gap_s', Math.round(agoMs(state.lastGenaAt) / 1000));
+    state.lastGenaAt = Date.now();
+    state.genaCount++;
+    bump('events');
     if (state.correlator) state.correlator.recordGena(masterVol, muted, recvAt);
     broadcastVolume(masterVol, muted);
   }
@@ -861,10 +1186,14 @@ function scheduleRenew(device, callbackUrl, negotiatedSeconds) {
       scheduleRenew(device, callbackUrl, result.negotiatedSeconds);
     } catch (e) {
       console.error('[gena] renew failed:', e.message, ', re-subscribing...');
+      bump('renew_failures');
+      note('renew failed (' + e.message + '), re-subscribing', 'warn');
       try {
         var sub = await subscribe(device, callbackUrl, EVENT_PATH, REQUESTED_TIMEOUT);
         state.sid = sub.sid; state.seqExpected = 0;
         console.log('[gena] re-subscribed SID:', sub.sid);
+        bump('resubscribes');
+        if (state.stats) state.stats.setSession({ sid: sub.sid }, true);
         scheduleRenew(device, callbackUrl, sub.negotiatedSeconds);
       } catch (e2) {
         console.error('[gena] re-subscribe failed:', e2.message);
@@ -895,18 +1224,40 @@ function startPeriodicSync() {
 // Shutdown
 // ---------------------------------------------------------------------------
 var shuttingDown = false;
-async function shutdown() {
+async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log('\n[main] shutting down...');
+  detail('shutdown requested (' + (signal || 'unknown') + ')');
   if (state.renewTimer)  clearTimeout(state.renewTimer);
   if (state.retryTimer)  clearTimeout(state.retryTimer);
   if (state.settleTimer) clearTimeout(state.settleTimer);
   if (state.inputHandle) state.inputHandle.close();
-  if (state.sid)         await unsubscribe(state.device, state.sid, EVENT_PATH).catch(function() {});
-  if (state.wss)         state.wss.close();
-  if (state.server)      state.server.close();
-  if (state.apiServer)   state.apiServer.close();
+
+  // The subscription is the one thing that outlives this process. If we are
+  // killed before this lands, the player keeps posting events to a TV that is
+  // no longer there, so record how it went.
+  if (state.sid) {
+    try {
+      var res = await genaLib.unsubscribeStatus(state.device, state.sid, EVENT_PATH);
+      detail('unsubscribed on shutdown (HTTP ' + res.statusCode + ')');
+      bump('clean_unsubscribes');
+    } catch (e) {
+      note('could not release the subscription on shutdown: ' + e.message, 'error');
+    }
+  }
+
+  if (state.stats) {
+    state.stats.setSession({
+      cleanExit:  true,
+      exitAt:     new Date().toISOString(),
+      lastSeenAt: new Date().toISOString()
+    }, true);
+  }
+
+  if (state.wss)       state.wss.close();
+  if (state.server)    state.server.close();
+  if (state.apiServer) state.apiServer.close();
   process.exit(0);
 }
 
@@ -991,11 +1342,19 @@ function runProbes(cb) {
 
 // ---------------------------------------------------------------------------
 async function main() {
-  state.diag     = new diagLib.DiagLog(DIAG_FILE);
+  state.diag    = new diagLib.DiagLog(DIAG_FILE,    { maxBytes: 128 * 1024 });
+  state.notable = new diagLib.DiagLog(NOTABLE_FILE, { maxBytes: 32 * 1024 });
+  state.stats   = new statsLib.Stats(STATS_FILE);
+
+  // Whatever the last run left behind, before this one overwrites it.
+  var prev = state.stats.rotateSession();
+  state.stats.bump('sessions');
+
   state.platform = compatLib.readPlatform();
   state.compat   = compatLib.checkPlatform(state.platform);
 
   state.diag.info('--- service start, v' + pkg.version + ' ---');
+  reportPreviousSession(prev);
   state.diag.info('platform: webOS ' + (state.platform.release || 'unknown') +
     ' on ' + (state.platform.model || 'unknown model') +
     ', node ' + state.platform.node);
@@ -1029,10 +1388,11 @@ async function main() {
   }
 
   startPeriodicSync();
+  startHeartbeat();
   runProbes(null);
 
-  process.on('SIGINT',  shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('SIGINT',  function () { shutdown('SIGINT'); });
+  process.on('SIGTERM', function () { shutdown('SIGTERM'); });
 }
 
 main().catch(function(err) {
