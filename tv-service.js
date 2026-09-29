@@ -38,23 +38,24 @@ var DEFAULT_LISTEN_PORT = 7474;
 var DEFAULT_WS_PORT     = 7475;
 var API_PORT            = 7476;
 
-var CONFIG_DIR  = '/var/lib/com.brineandbuild.sonosoverlay';
+var APP_ID      = 'com.brineandbuild.sonosoverlay';
+var CONFIG_DIR  = '/var/lib/' + APP_ID;
 var CONFIG_FILE = CONFIG_DIR + '/config.json';
 
-// Patching the compositor's volume QML is what puts the number back on screen.
-// The boot hook runs this on every power-on, and setup runs it once so a fresh
-// install works without needing a reboot first.
-var OVERLAY_APPLY_SH =
-  'QML=/usr/lib/qml/WebOSCompositor/views/volume/StarfishVolume.qml\n' +
-  'PATCHED=/var/lib/com.brineandbuild.sonosoverlay/StarfishVolume.qml\n' +
-  'if [ -f "$QML" ] && grep -q external_arc "$QML" && [ ! -f "$PATCHED" ]; then\n' +
-  '  mkdir -p /var/lib/com.brineandbuild.sonosoverlay\n' +
-  '  sed \'/external_arc/d\' "$QML" > "$PATCHED"\n' +
-  'fi\n' +
-  'if [ -f "$PATCHED" ] && ! grep -q StarfishVolume.qml /proc/mounts; then\n' +
-  '  mount --bind "$PATCHED" "$QML" 2>/dev/null\n' +
-  '  systemctl restart surface-manager-daemon.service 2>/dev/null\n' +
-  'fi\n';
+// Putting the number back on screen means patching the compositor's volume
+// QML. The file lives on a read-only compressed filesystem, so a patched copy
+// is bind mounted over it, and the compositor only reads it when it starts.
+var QML_PATH    = '/usr/lib/qml/WebOSCompositor/views/volume/StarfishVolume.qml';
+var PATCHED_QML = CONFIG_DIR + '/StarfishVolume.qml';
+
+// Where the boot hook lives. It starts the service and nothing else; the QML
+// work used to happen here, which restarted the compositor at a moment nobody
+// chose, roughly 40s into every boot, closing whatever had been opened.
+var BOOT_HOOK_DIR  = '/var/lib/webosbrew/init.d';
+var BOOT_HOOK_PATH = BOOT_HOOK_DIR + '/sonos-overlay';
+
+// How often to re-check whether the screen is free enough to restart on.
+var RESTART_POLL_MS = 20000;
 // Persistent, unlike /var/log which is a ramfs and is wiped on every boot.
 var DIAG_FILE    = CONFIG_DIR + '/diagnostics.log';
 var NOTABLE_FILE = CONFIG_DIR + '/notable.log';
@@ -108,6 +109,13 @@ var MAX_RAISE_PER_CORRECTION = 20;
 var SETTLE_MS      = 400;
 var SETTLE_POLL_MS = 700;
 
+// How long an instruction stays outstanding before we stop trying. Normally it
+// is cleared within a few seconds by the check that follows every write, so
+// this only matters for a player that will not move at all. It has to be
+// longer than the sync interval, or a retry could never happen before the
+// instruction expired.
+var PENDING_MAX_MS = 25000;
+
 // No eARC session means CEC presses never reach the Arc, but the TV still
 // moves its own counter, and we mirror that counter to the Arc on every settle.
 // The old SOAP-fallback special case is therefore gone: one path covers both.
@@ -153,6 +161,23 @@ var state = {
   lastGenaAt:    0,      // when the player last told us anything
   genaCount:     0,      // events this session, for spotting a silent player
   pollGenaMark:  0,      // genaCount as of the previous poll
+
+  overlayMounted:     false,
+  overlayRestartTimer: null,
+  overlayDeferredFor:  null,  // the app we are waiting to get out from under
+
+  // The value the TV asked the player to reach, and when it was asked. While
+  // it is outstanding we are mid-move, so the player's own reports are
+  // catch-up rather than someone else's change.
+  pendingTarget: null,
+  pendingSince:  0,
+
+  // Each side as of the last reconciliation, so the next one can tell which
+  // of them moved rather than assuming the player should always be twice the
+  // TV. Without this, anything set from the Sonos app is undone on the next
+  // tick, and the player can never rest on an odd number.
+  lastKnownTv:    null,
+  lastKnownSonos: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -315,6 +340,14 @@ function buildDiagnosticsReport() {
     ? Math.round((Date.now() - state.lastKeyAt) / 1000) + 's ago' : 'none'));
   L.push('last event:     ' + (state.lastGenaAt
     ? Math.round((Date.now() - state.lastGenaAt) / 1000) + 's ago' : 'none this session'));
+  L.push('on-screen num:  ' +
+    ((state.config && state.config.showOnScreenVolume === false)
+      ? 'turned off in settings'
+      : (isQmlMounted() ? 'patch mounted' : 'patch not mounted') +
+        (state.overlayDeferredFor
+          ? ', compositor restart held while ' + state.overlayDeferredFor +
+            ' is in front'
+          : '')));
   L.push('');
   summaryLines().forEach(function (s) { L.push(s); });
   L.push('');
@@ -355,9 +388,17 @@ function summaryLines() {
   row('corrections',     n('corrections'),  'volume writes we sent the player');
   row('correction miss', n('correction_missed'),
       'writes where the player did not end up where asked');
-  row('adoptions',       n('adoptions'),    'external changes pulled into the TV');
+  row('adoptions',       n('adoptions'),    'external changes shown on the TV');
   row('  while pending', n('adoptions_while_pending'),
       'adopted while our own correction was still settling');
+  row('catch-up ignored', n('catchup_ignored'),
+      'player reports treated as lag, not as someone else');
+  row('gave up',         n('pending_abandoned'),
+      'instructions the player never reached');
+  L.push('');
+  row('screen restarts', n('compositor_restarts'));
+  row('  deferred',      n('restarts_deferred'),
+      'held back because an app was in front');
   L.push('');
   row('events received', n('events'));
   row('event gaps',      n('event_gaps'),
@@ -376,6 +417,223 @@ function summaryLines() {
            ', exit ' + (prev.cleanExit ? 'clean' : 'not recorded'));
   }
   return L;
+}
+
+// ---------------------------------------------------------------------------
+// The on-screen number: patch, mount, and choosing when to restart.
+// ---------------------------------------------------------------------------
+function isQmlMounted() {
+  try {
+    return fs.readFileSync('/proc/mounts', 'utf8').indexOf('StarfishVolume.qml') !== -1;
+  } catch (e) { return false; }
+}
+
+// The patch simply removes the guard that hides LG's own volume display when
+// sound is leaving over ARC. Kept once built; the source file never changes
+// unless the TV takes a firmware update.
+function ensurePatchedCopy() {
+  try {
+    if (fs.existsSync(PATCHED_QML)) return true;
+    var src = fs.readFileSync(QML_PATH, 'utf8');
+    if (src.indexOf('external_arc') === -1) return false;
+    var out = src.split('\n').filter(function (line) {
+      return line.indexOf('external_arc') === -1;
+    }).join('\n');
+    if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(PATCHED_QML, out, 'utf8');
+    detail('built the volume patch for this firmware');
+    return true;
+  } catch (e) {
+    note('could not prepare the volume patch: ' + e.message, 'error');
+    return false;
+  }
+}
+
+// Apps a compositor restart would destroy. Home screens and inputs lose
+// nothing, so those are fair game; a streaming app someone is watching is not.
+function isRestartSafe(appId) {
+  if (!appId) return true;                                    // nothing in front
+  if (appId === 'com.webos.app.home') return true;
+  if (appId === 'com.webos.app.livetv') return true;
+  if (appId.indexOf('com.webos.app.hdmi') === 0) return true;
+  if (appId.indexOf('com.webos.app.externalinput') === 0) return true;
+  if (appId.indexOf('com.webos.app.inputcommon') === 0) return true;
+  if (appId.indexOf('com.webos.app.factorywin') === 0) return true;
+  return false;
+}
+
+// Fails toward "safe" on purpose. If we cannot tell what is in front, behave
+// the way earlier versions always did and restart, rather than risk never
+// applying the patch and silently losing the on-screen number.
+function getForegroundApp(cb) {
+  cp.exec('/usr/bin/luna-send -n 1 -f ' +
+          'luna://com.webos.applicationManager/getForegroundAppInfo \'{}\' 2>/dev/null',
+    { timeout: 4000 }, function (err, stdout) {
+      if (err || !stdout) { cb(null); return; }
+      try {
+        var j  = JSON.parse(stdout);
+        var fg = j.foregroundAppInfo;
+        var id = j.appId ||
+                 (Array.isArray(fg) && fg.length && fg[0].appId) ||
+                 null;
+        cb(id || null);
+      } catch (e) { cb(null); }
+    });
+}
+
+function restartCompositor(appId, reason) {
+  state.overlayRestartTimer = null;
+  state.overlayDeferredFor  = null;
+  detail('restarting the compositor to apply the volume patch (' + reason +
+         ', in front: ' + (appId || 'nothing') + ')');
+  bump('compositor_restarts');
+  cp.exec('systemctl restart surface-manager-daemon.service 2>/dev/null',
+    function (err) {
+      if (err) note('compositor restart failed: ' + err.message, 'error');
+    });
+}
+
+// The mount does nothing until the compositor restarts, and the restart tears
+// down whatever is on screen. At boot that is usually the home screen or an
+// input and costs nothing, but on a TV that resumes an app at power on it
+// closes what the viewer was watching.
+//
+// Waiting is off by default, because it is a real trade: the screen survives,
+// but the on-screen number does not start working until the viewer next
+// passes through the home screen. TVs that boot straight to an input, where
+// the restart costs nothing, are better off restarting immediately.
+function scheduleCompositorRestart(reason, force) {
+  if (state.overlayRestartTimer) {
+    clearTimeout(state.overlayRestartTimer);
+    state.overlayRestartTimer = null;
+  }
+  if (force) { restartCompositor(null, reason); return; }
+
+  if (!(state.config && state.config.deferScreenRestart === true)) {
+    restartCompositor(null, reason);
+    return;
+  }
+
+  getForegroundApp(function (appId) {
+    if (isRestartSafe(appId)) { restartCompositor(appId, reason); return; }
+
+    if (state.overlayDeferredFor !== appId) {
+      state.overlayDeferredFor = appId;
+      detail('holding the compositor restart while ' + appId +
+             ' is in front; the on-screen number starts working once the ' +
+             'screen is free');
+      bump('restarts_deferred');
+    }
+    state.overlayRestartTimer = setTimeout(function () {
+      scheduleCompositorRestart(reason, false);
+    }, RESTART_POLL_MS);
+  });
+}
+
+// cb(applied) where applied is true only if the patch is already live.
+function applyOverlay(opts, cb) {
+  opts = opts || {};
+  cb   = cb || function () {};
+
+  if (!opts.force && state.config && state.config.showOnScreenVolume === false) {
+    detail('on-screen volume number is turned off in settings, ' +
+           'leaving the compositor alone');
+    cb(false);
+    return;
+  }
+
+  if (isQmlMounted()) {
+    state.overlayMounted = true;
+    cb(true);
+    return;
+  }
+
+  if (!ensurePatchedCopy()) {
+    note('this firmware has no volume guard to patch, so the on-screen ' +
+         'number cannot be restored here', 'warn');
+    cb(false);
+    return;
+  }
+
+  cp.exec('mount --bind "' + PATCHED_QML + '" "' + QML_PATH + '" 2>/dev/null',
+    function (err) {
+      if (err) {
+        note('mounting the volume patch failed: ' + err.message, 'error');
+        cb(false);
+        return;
+      }
+      state.overlayMounted = true;
+      detail('volume patch mounted');
+      scheduleCompositorRestart(opts.reason || 'startup', !!opts.force);
+      cb(false);
+    });
+}
+
+// Asking the page to close itself with PalmSystem.hide() or window.close()
+// does nothing on some builds, which left the Finish button stuck on
+// "Finishing..." forever. The app manager will do it properly. Method names
+// differ between webOS versions, so try both and ignore failures.
+// luna-send exits 0 even when the call it made failed, so the reply has to be
+// read rather than the exit code. On webOS 6 closeByAppId is the method that
+// works; plain close answers "no app matched by pid".
+function lunaCall(uri, payload, cb) {
+  cp.exec('/usr/bin/luna-send -n 1 -f ' + uri + ' \'' + payload + '\' 2>/dev/null',
+    { timeout: 5000 }, function (err, stdout) {
+      if (err || !stdout) { cb(false); return; }
+      try { cb(JSON.parse(stdout).returnValue === true); }
+      catch (e) { cb(false); }
+    });
+}
+
+function closeSetupApp() {
+  var payload = '{"id":"' + APP_ID + '"}';
+  lunaCall('luna://com.webos.applicationManager/closeByAppId', payload,
+    function (ok) {
+      if (ok) { detail('setup app closed'); return; }
+      lunaCall('luna://com.webos.applicationManager/close', payload,
+        function (ok2) {
+          detail(ok2 ? 'setup app closed'
+                     : 'could not close the setup app from the service',
+                 ok2 ? 'info' : 'warn');
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Boot hook
+// ---------------------------------------------------------------------------
+// It starts the service and nothing else. Everything about the screen is now
+// decided by the service, which can see what is in front of it.
+function bootHookScript() {
+  return '#!/bin/sh\n' +
+    'iptables -I INPUT -p tcp --dport ' + DEFAULT_LISTEN_PORT + ' -j ACCEPT 2>/dev/null\n' +
+    'iptables -I INPUT -p tcp --dport ' + DEFAULT_WS_PORT + ' -j ACCEPT 2>/dev/null\n' +
+    'iptables -I INPUT -p tcp --dport ' + API_PORT + ' -j ACCEPT 2>/dev/null\n' +
+    // Only wait if there was something to kill; at boot there never is, and
+    // the wait was costing a second of every power-on.
+    'if pkill -f \'tv-service.bundle.js\' 2>/dev/null; then sleep 1; fi\n' +
+    'APP=' + APP_DIR + '\n' +
+    'nohup /usr/bin/node "$APP/tv-service.bundle.js" >> /var/log/sonos-overlay.log 2>&1 &\n';
+}
+
+function writeBootHook() {
+  if (!fs.existsSync(BOOT_HOOK_DIR)) fs.mkdirSync(BOOT_HOOK_DIR, { recursive: true });
+  fs.writeFileSync(BOOT_HOOK_PATH, bootHookScript(), 'utf8');
+  fs.chmodSync(BOOT_HOOK_PATH, 0o755);
+}
+
+// An update rewrites its own hook. Without this, someone upgrading would keep
+// the old hook forever, and it is the old hook that restarts the compositor
+// from the boot path.
+function healBootHook() {
+  try {
+    if (!fs.existsSync(BOOT_HOOK_PATH)) return;   // setup owns first install
+    if (fs.readFileSync(BOOT_HOOK_PATH, 'utf8') === bootHookScript()) return;
+    writeBootHook();
+    detail('boot hook replaced with the current version');
+  } catch (e) {
+    detail('could not update the boot hook: ' + e.message, 'warn');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -482,7 +740,16 @@ function startApiServer() {
         platform:     state.platform,
         compat:       state.compat,
         probes:       state.probes,
-        tvIp:         detectLanIp(),
+        // Never let a missing network take the whole service down from here.
+        tvIp:         (function () {
+                        try { return detectLanIp(); } catch (e) { return null; }
+                      })(),
+        showOnScreenVolume: !(state.config &&
+                              state.config.showOnScreenVolume === false),
+        deferScreenRestart: !!(state.config &&
+                               state.config.deferScreenRestart === true),
+        overlayApplied:     isQmlMounted(),
+        overlayWaitingFor:  state.overlayDeferredFor,
       }));
       return;
     }
@@ -531,15 +798,49 @@ function startApiServer() {
       return;
     }
 
+    // Merged, not replaced, so a partial update can change one setting and
+    // reconfiguring the player does not throw away the learned UUID or the
+    // volume ceiling.
     if (url === '/api/config' && req.method === 'POST') {
       readBody(req, function(body) {
-        if (!body.sonosIp) { res.end(JSON.stringify({ ok: false, error: 'Missing sonosIp' })); return; }
-        saveConfig(body);
-        state.config = body;
-        console.log('[api] config saved, connecting to Sonos at', body.sonosIp);
-        connectToSonos(body).catch(function(e) {
-          console.error('[api] connect error after config save:', e.message);
-        });
+        var merged = {};
+        var prev   = state.config || {};
+        Object.keys(prev).forEach(function (k) { merged[k] = prev[k]; });
+        Object.keys(body).forEach(function (k) { merged[k] = body[k]; });
+
+        if (!merged.sonosIp) {
+          res.end(JSON.stringify({ ok: false, error: 'Missing sonosIp' }));
+          return;
+        }
+
+        var playerChanged = merged.sonosIp !== prev.sonosIp ||
+                            merged.sonosPort !== prev.sonosPort;
+        var overlayChanged = ('showOnScreenVolume' in body) &&
+                             body.showOnScreenVolume !== prev.showOnScreenVolume;
+
+        saveConfig(merged);
+        state.config = merged;
+
+        if (overlayChanged) {
+          if (merged.showOnScreenVolume === false) {
+            // Unmounting now leaves the next compositor start clean. The
+            // number keeps showing until then, which is harmless.
+            cp.exec('umount "' + QML_PATH + '" 2>/dev/null', function () {});
+            detail('on-screen number turned off; it stops appearing after the ' +
+                   'next restart');
+          } else {
+            applyOverlay({ reason: 'turned on in settings' }, function () {});
+          }
+        }
+
+        if (playerChanged || !state.device) {
+          console.log('[api] config saved, connecting to Sonos at', merged.sonosIp);
+          connectToSonos(merged).catch(function(e) {
+            console.error('[api] connect error after config save:', e.message);
+          });
+        } else {
+          console.log('[api] config saved, player unchanged');
+        }
         res.end(JSON.stringify({ ok: true }));
       });
       return;
@@ -559,48 +860,43 @@ function startApiServer() {
     // Applies the on-screen indicator now, without waiting for a reboot.
     // Restarting the compositor tears down whatever is on screen, including the
     // setup app itself, so this is only called as the last step of setup.
+    // The last step of setup. Pressing Finish is an explicit instruction, so
+    // this is the one path that restarts the compositor without waiting for a
+    // convenient moment: the user is looking at the setup app and expects it
+    // to close.
     if (url === '/api/apply-overlay' && req.method === 'POST') {
-      var mounted = false;
-      try {
-        mounted = fs.readFileSync('/proc/mounts', 'utf8')
-                    .indexOf('StarfishVolume.qml') !== -1;
-      } catch (e) { /* treat as not mounted */ }
-
-      if (mounted) {
+      if (isQmlMounted()) {
+        state.overlayMounted = true;
         res.end(JSON.stringify({ ok: true, alreadyApplied: true }));
+        closeSetupApp();
+        return;
+      }
+
+      if (state.config && state.config.showOnScreenVolume === false) {
+        res.end(JSON.stringify({ ok: true, alreadyApplied: true, disabled: true }));
+        closeSetupApp();
         return;
       }
 
       // Answer before restarting; the restart kills the webview waiting on us.
       res.end(JSON.stringify({ ok: true, restarting: true }));
       setTimeout(function() {
-        cp.exec(OVERLAY_APPLY_SH, function(err) {
-          if (err && state.diag) {
-            state.diag.error('apply-overlay failed: ' + err.message);
-          }
-        });
+        applyOverlay({ force: true, reason: 'setup finished' }, function() {});
       }, 600);
       return;
     }
 
+    // Closing the app from the page does not work on every webOS build, so the
+    // service does it through the app manager instead.
+    if (url === '/api/close-app' && req.method === 'POST') {
+      res.end(JSON.stringify({ ok: true }));
+      closeSetupApp();
+      return;
+    }
+
     if (url === '/api/startup-hook' && req.method === 'POST') {
-      var hookDir  = '/var/lib/webosbrew/init.d';
-      var hookPath = hookDir + '/sonos-overlay';
-      // The QML steps come from OVERLAY_APPLY_SH so the boot path and the
-      // setup path can never drift apart.
-      var script   = '#!/bin/sh\n' +
-        'iptables -I INPUT -p tcp --dport 7474 -j ACCEPT 2>/dev/null\n' +
-        'iptables -I INPUT -p tcp --dport 7475 -j ACCEPT 2>/dev/null\n' +
-        'iptables -I INPUT -p tcp --dport 7476 -j ACCEPT 2>/dev/null\n' +
-        OVERLAY_APPLY_SH +
-        'pkill -f \'tv-service.bundle.js\' 2>/dev/null\n' +
-        'sleep 1\n' +
-        'APP=/media/developer/apps/usr/palm/applications/com.brineandbuild.sonosoverlay\n' +
-        'nohup /usr/bin/node "$APP/tv-service.bundle.js" >> /var/log/sonos-overlay.log 2>&1 &\n';
       try {
-        if (!fs.existsSync(hookDir)) fs.mkdirSync(hookDir, { recursive: true });
-        fs.writeFileSync(hookPath, script, 'utf8');
-        fs.chmodSync(hookPath, 0o755);
+        writeBootHook();
         res.end(JSON.stringify({ ok: true }));
       } catch (e) {
         res.end(JSON.stringify({ ok: false, error: e.message }));
@@ -736,7 +1032,12 @@ async function connectToSonos(config, attempt) {
     state.sonosVol        = initVol;
     state.tvVol           = seed;
     state.optimisticMuted = false;
+    // Both sides start known and agreed, so the first sync tick sees no
+    // movement and leaves them alone.
+    state.lastKnownTv     = seed;
+    state.lastKnownSonos  = initVol;
     console.log('[main] seeding TV to', seed, 'from Arc', initVol, '(2:1)');
+    detail('boot seed: Arc ' + initVol + ', TV set to ' + seed);
     pushTvVolume(seed);
     refreshTransportState();
 
@@ -907,15 +1208,22 @@ function scheduleSettle() {
   state.settleTimer = setTimeout(function() {
     state.settleTimer = null;
     if (!settled()) { scheduleSettle(); return; }
-    reconcileTvAndSonos();
+    reconcileTvAndSonos('settle');
   }, SETTLE_POLL_MS);
 }
 
-// The TV leads, always. Read its counter, mirror it to the Arc. Nothing here
-// writes back to the TV except to enforce the ceiling, so the number on screen
-// is never yanked out from under the user, which is exactly what the old
-// two-way version did on every single press once the two sides had drifted.
-function reconcileTvAndSonos() {
+// The TV leads when the remote is used, and only then.
+//
+// reason 'settle' means a keypress just finished, which is an instruction: the
+// player is driven to twice the TV's value. reason 'sync' is the periodic tick,
+// which reads both sides for the record and finishes an instruction that has
+// not landed yet, but never invents one of its own. That distinction is the
+// whole point: the old version reconciled unconditionally every 10 seconds, so
+// any volume set from the Sonos app was undone within seconds, and because the
+// player was forced onto twice the TV's value it could never rest on an odd
+// number at all.
+function reconcileTvAndSonos(reason) {
+  reason = reason || 'settle';
   if (!state.device) return;
   readTvVolume(function(tvVol) {
     if (tvVol === null) return;
@@ -936,17 +1244,93 @@ function reconcileTvAndSonos() {
       recordPlayerLatency(Date.now() - askedAt);
       checkForMissedEvent(sonosVol);
 
+      // Which side moved since we last looked. This is the whole arbitration:
+      // the old code compared the player against twice the TV's value, so it
+      // re-asserted that relationship forever and undid anything done from the
+      // Sonos app within ten seconds. Comparing against what each side was
+      // last seen at instead means a change is followed once, by whichever
+      // side made it, and then left alone.
+      var tvMoved    = state.lastKnownTv    !== null && tvVol    !== state.lastKnownTv;
+      var sonosMoved = state.lastKnownSonos !== null && sonosVol !== state.lastKnownSonos;
       state.sonosVol = sonosVol;
-      var target = clampVol(tvToSonos(state.tvVol));
-      if (target === sonosVol) { closeBurst(null); return; }
+
+      if (reason === 'settle') {
+        // The remote was used. That is an instruction, and the TV leads.
+        state.pendingTarget = clampVol(tvToSonos(state.tvVol));
+        state.pendingSince  = Date.now();
+      } else if (state.pendingTarget !== null &&
+                 state.pendingTarget === sonosVol) {
+        // Reached. Checked before expiry, because the sync interval is longer
+        // than the expiry window, so an instruction that succeeded would
+        // otherwise be reported as having been given up on.
+        state.pendingTarget  = null;
+        state.lastKnownTv    = state.tvVol;
+        state.lastKnownSonos = sonosVol;
+        closeBurst(null);
+        return;
+      } else if (state.pendingTarget !== null &&
+                 agoMs(state.pendingSince) > PENDING_MAX_MS) {
+        note('gave up trying to move the player to ' + state.pendingTarget +
+             ', it is on ' + sonosVol + ' after ' +
+             Math.round(agoMs(state.pendingSince) / 1000) + 's', 'warn');
+        bump('pending_abandoned');
+        state.pendingTarget = null;
+        state.lastKnownTv    = state.tvVol;
+        state.lastKnownSonos = sonosVol;
+        return;
+      } else if (state.pendingTarget === null && tvMoved) {
+        // The TV moved without a keypress we saw: voice control, the LG app,
+        // or a CEC command from something else. The TV still leads, so the
+        // player follows, exactly as it did before this arbitration existed.
+        detail('TV led: ' + state.lastKnownTv + ' -> ' + tvVol +
+               ' with no keypress, moving the player to match');
+        bump('tv_led');
+        state.pendingTarget = clampVol(tvToSonos(state.tvVol));
+        state.pendingSince  = Date.now();
+      } else if (state.pendingTarget === null && sonosMoved) {
+        // The player moved and the TV did not: someone used the Sonos app, or
+        // another device in the household. Show it on the TV and leave the
+        // player where it was put, odd number and all.
+        var shown = Math.min(sonosToTv(sonosVol), maxTvVol());
+        detail('player led: Arc ' + state.lastKnownSonos + ' -> ' + sonosVol +
+               ', showing ' + shown + ' on the TV');
+        bump('player_led');
+        if (shown !== tvVol) { state.tvVol = shown; pushTvVolume(shown); }
+        state.lastKnownTv    = state.tvVol;
+        state.lastKnownSonos = sonosVol;
+        closeBurst(null);
+        return;
+      } else if (state.pendingTarget === null) {
+        // Nothing moved on either side. Nothing to do, which is the case the
+        // old version got wrong by writing anyway.
+        closeBurst(null);
+        return;
+      }
+
+      var target = state.pendingTarget;
+      if (target === sonosVol) {
+        // Either CEC already carried it there or our write landed.
+        state.pendingTarget  = null;
+        state.lastKnownTv    = state.tvVol;
+        state.lastKnownSonos = sonosVol;
+        closeBurst(null);
+        return;
+      }
 
       // Never jump the Arc up by a lot in one correction. Going down is always
-      // safe so it is unrestricted; the next poll closes any remaining gap.
+      // safe so it is unrestricted. The rest of the gap is closed by a
+      // follow-up rather than by the next sync tick, which could otherwise
+      // arrive after the instruction has already expired.
+      var limited = false;
       if (target > sonosVol + MAX_RAISE_PER_CORRECTION) {
-        target = sonosVol + MAX_RAISE_PER_CORRECTION;
+        target  = sonosVol + MAX_RAISE_PER_CORRECTION;
+        limited = true;
         console.warn('[cap] limiting raise to', target, '- TV asked for', state.tvVol);
-        note('raise limited to ' + target + ', TV asked for Arc ' +
-             tvToSonos(state.tvVol), 'warn');
+        note('raise limited to ' + target + ' on the way to ' +
+             state.pendingTarget, 'warn');
+      }
+      if (limited) {
+        setTimeout(function () { reconcileTvAndSonos('sync'); }, 1500);
       }
 
       console.log('[settle] TV', state.tvVol, '(wants Arc ' + tvToSonos(state.tvVol) + ')',
@@ -954,6 +1338,11 @@ function reconcileTvAndSonos() {
       state.pendingSonosWrite = target;
       state.lastWriteAt  = Date.now();
       state.lastWriteVal = target;
+      // Recorded as intended, so the echo does not read as the player moving
+      // by itself on the next tick. A failed write leaves the instruction
+      // outstanding, and the pending branch keeps retrying it.
+      state.lastKnownTv    = state.tvVol;
+      state.lastKnownSonos = target;
       bump('corrections');
       detail('CORRECT: TV ' + state.tvVol + ' wants Arc ' +
              tvToSonos(state.tvVol) + ', Arc was ' + sonosVol +
@@ -1023,7 +1412,17 @@ function verifyWrite(target, before) {
     if (state.lastKeyAt > writeAt) return;
 
     getVolume(state.device).then(function (v) {
-      if (v === target) return;   // the normal case, and not worth a line
+      if (v === target) {
+        // Landed. Clearing the instruction here rather than waiting for the
+        // next sync tick is what keeps the window where the player's own
+        // reports are treated as catch-up down to a few seconds.
+        if (state.pendingTarget === target) {
+          state.pendingTarget  = null;
+          state.lastKnownTv    = state.tvVol;
+          state.lastKnownSonos = v;
+        }
+        return;
+      }
       bump('correction_missed');
       note('VERIFY: asked the player for ' + target + ' (it was ' + before +
            '), ' + Math.round(WRITE_ECHO_MS / 1000) + 's later it is on ' + v);
@@ -1059,14 +1458,21 @@ function reconcile(genaVol, genaMuted) {
   // Adopt it into the TV rather than reverting it, so app control keeps working
   //, otherwise TV-leads would silently undo every change made from a phone.
   if (state.tvVol !== null && genaVol !== tvToSonos(state.tvVol)) {
+    // An instruction of ours is still outstanding, so this is the player
+    // catching up, not a person. Adopting here is what dragged the TV down to
+    // half a lagging player's value part way through a held button.
+    if (state.pendingTarget !== null) {
+      bump('catchup_ignored');
+      detail('catch-up: Arc ' + prev + ' -> ' + genaVol +
+             ' while on the way to ' + state.pendingTarget + ', not adopting');
+      return;
+    }
+
     var adopted = Math.min(sonosToTv(genaVol), maxTvVol());
     console.log('[extern] Arc moved', prev, '->', genaVol,
-      'with no keypress, adopting into TV as', adopted);
+      'with no keypress, showing on the TV as', adopted);
 
-    // Everything needed to judge afterwards whether this adoption was right.
-    // Two cases look identical here and are not: a person on their phone, and
-    // the player still catching up from presses we just made.
-    var sinceWrite = agoMs(state.lastWriteAt);
+    var sinceWrite    = agoMs(state.lastWriteAt);
     var stillSettling = sinceWrite !== null && sinceWrite < WRITE_ECHO_MS;
     bump('adoptions');
     if (stillSettling) bump('adoptions_while_pending');
@@ -1079,8 +1485,17 @@ function reconcile(genaVol, genaMuted) {
       (state.lastWriteVal === null ? '' : ' (asked ' + state.lastWriteVal + ')') +
       (stillSettling ? ' | SUSPECT: our own correction was still settling' : ''));
 
+    // The TV number becomes a display of what the player is doing. It is
+    // deliberately not followed by writing twice this value back to the
+    // player: that is what turned a nudge to 9 into 10, and undid a nudge
+    // down to 9 completely. The player keeps what it was given, odd or not.
     state.tvVol = adopted;
     pushTvVolume(adopted);
+
+    // Both sides recorded as intended, so the sync tick that follows does not
+    // see our own display update as the TV moving and push the player back.
+    state.lastKnownTv    = adopted;
+    state.lastKnownSonos = genaVol;
   }
 }
 
@@ -1216,7 +1631,7 @@ function startPeriodicSync() {
     refreshTransportState();
     // Never correct while a keypress burst is still settling.
     if (!settled()) return;
-    reconcileTvAndSonos();
+    reconcileTvAndSonos('sync');
   }, SYNC_INTERVAL_MS);
 }
 
@@ -1379,8 +1794,17 @@ async function main() {
   await delay(150);
 
   var config = readConfig();
+  if (config) state.config = config;
+
+  // Bring an older install's boot hook up to date, then take care of the
+  // screen ourselves rather than leaving it to the hook.
+  healBootHook();
+  applyOverlay({ reason: 'startup' }, function (already) {
+    detail(already ? 'on-screen number was already active at startup'
+                   : 'on-screen number is being set up');
+  });
+
   if (config) {
-    state.config = config;
     console.log('[main] config found, connecting to Sonos at', config.sonosIp);
     await connectToSonos(config);
   } else {

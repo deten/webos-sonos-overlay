@@ -267,6 +267,34 @@ h2 { font-size:48px; font-weight:700; margin-bottom:16px; line-height:1.15; }
           Press Vol+ or Vol− anytime to see the volume.
         </div>
         <div class="note ok" id="done-details"></div>
+
+        <div class="note" style="margin-top:20px;text-align:left">
+          <div id="osd-state">Volume number on screen: on</div>
+          <div style="font-size:16px;color:#777;margin-top:6px">
+            Showing the number needs a patched system file, which means the
+            screen goes black for a few seconds once after each power on. Turn
+            it off to keep volume syncing with no interruption at all.
+          </div>
+          <div class="btn-row" style="margin-top:12px">
+            <button class="btn btn-secondary" id="btn-osd" onclick="toggleOsd()">
+              Turn off
+            </button>
+          </div>
+
+          <div id="defer-state" style="margin-top:18px">Wait for a free screen: off</div>
+          <div style="font-size:16px;color:#777;margin-top:6px">
+            If your TV resumes an app when it turns on, that black screen
+            closes the app. Turn this on to hold it back until you are on the
+            home screen or an input, at the cost of the number not working
+            until then.
+          </div>
+          <div class="btn-row" style="margin-top:12px">
+            <button class="btn btn-secondary" id="btn-defer" onclick="toggleDefer()">
+              Turn on
+            </button>
+          </div>
+        </div>
+
         <div class="note" style="margin-top:24px;font-size:18px;color:#555;">
           Support: p0txecpth@gmail.com
         </div>
@@ -479,6 +507,14 @@ function onServiceReady(status) {
   // Tell the overlay to hide so it doesn't intercept cursor input during setup
   apiPost('/api/setup-mode', {}).catch(function() {});
 
+  if (status && typeof status.showOnScreenVolume === 'boolean') {
+    osdOn = status.showOnScreenVolume;
+  }
+  if (status && typeof status.deferScreenRestart === 'boolean') {
+    deferOn = status.deferScreenRestart;
+  }
+  renderOsd();
+
   // Advisory only, an untested version still proceeds through setup.
   renderCompat(status);
 
@@ -662,11 +698,86 @@ function finishSetup() {
   goTo(4);
 }
 
+// ── The on-screen number, which can be switched off ───────────────────────
+var osdOn    = true;
+var deferOn  = false;
+
+function renderOsd() {
+  var label = document.getElementById('osd-state');
+  var btn   = document.getElementById('btn-osd');
+  if (label) label.textContent = 'Volume number on screen: ' + (osdOn ? 'on' : 'off');
+  if (btn)   btn.textContent   = osdOn ? 'Turn off' : 'Turn on';
+
+  var dlabel = document.getElementById('defer-state');
+  var dbtn   = document.getElementById('btn-defer');
+  if (dlabel) dlabel.textContent = 'Wait for a free screen: ' + (deferOn ? 'on' : 'off');
+  if (dbtn)   dbtn.textContent   = deferOn ? 'Turn off' : 'Turn on';
+}
+
+function toggleDefer() {
+  var want = !deferOn;
+  var btn  = document.getElementById('btn-defer');
+  if (btn) btn.disabled = true;
+  apiPost('/api/config', { deferScreenRestart: want }).then(function (res) {
+    if (res && res.ok) deferOn = want;
+    if (btn) btn.disabled = false;
+    renderOsd();
+  }).catch(function () {
+    if (btn) btn.disabled = false;
+  });
+}
+
+function toggleOsd() {
+  var want = !osdOn;
+  var btn  = document.getElementById('btn-osd');
+  if (btn) { btn.disabled = true; }
+
+  apiPost('/api/config', { showOnScreenVolume: want }).then(function (res) {
+    if (res && res.ok) osdOn = want;
+    if (btn) btn.disabled = false;
+    renderOsd();
+    var note = document.getElementById('done-details');
+    if (note) {
+      note.className = 'note ok';
+      note.textContent = want
+        ? 'The number will appear from the next time the screen restarts.'
+        : 'The number is off. Volume will still follow the TV.';
+    }
+  }).catch(function () {
+    if (btn) btn.disabled = false;
+  });
+}
+
+// Closing from inside the page works on some builds and silently does nothing
+// on others, which left the button stuck on "Finishing..." for a tester. Try
+// the page-level calls, then ask the service to close us through the app
+// manager, which is the one method that does not depend on this webview.
 function hideApp() {
   try {
-    if (window.PalmSystem && window.PalmSystem.hide) { window.PalmSystem.hide(); return; }
-  } catch (e) { /* fall through to close */ }
-  try { window.close(); } catch (e) { /* nothing left to try */ }
+    if (window.webOSSystem && window.webOSSystem.platformBack) {
+      window.webOSSystem.platformBack();
+    } else if (window.PalmSystem && window.PalmSystem.hide) {
+      window.PalmSystem.hide();
+    }
+  } catch (e) { /* fall through */ }
+  try { window.close(); } catch (e) { /* fall through */ }
+
+  // If we are still here a moment later, nothing above worked.
+  setTimeout(function () {
+    apiPost('/api/close-app', {}).catch(function () {
+      var btn = document.getElementById('btn-close');
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Close Setup';
+      }
+      var note = document.getElementById('done-details');
+      if (note) {
+        note.className = 'note';
+        note.textContent = 'Setup is complete. You can press Back or Home on ' +
+          'the remote to leave this app.';
+      }
+    });
+  }, 700);
 }
 
 // The on-screen indicator needs the compositor's volume QML patched and the
