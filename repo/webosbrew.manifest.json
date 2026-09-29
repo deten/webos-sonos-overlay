@@ -1,15 +1,15 @@
 {
   "id": "com.brineandbuild.sonosoverlay",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "type": "web",
   "title": "Sonos Volume Overlay",
   "appDescription": "Sonos volume sync and on-screen volume indicator for webOS LG TVs",
   "iconUri": "https://raw.githubusercontent.com/deten/webos-sonos-overlay/main/repo/icon.png",
   "sourceUrl": "https://github.com/deten/webos-sonos-overlay",
   "rootRequired": true,
-  "ipkUrl": "https://github.com/deten/webos-sonos-overlay/releases/download/v0.9.0/com.brineandbuild.sonosoverlay_0.9.0_all.ipk",
+  "ipkUrl": "https://github.com/deten/webos-sonos-overlay/releases/download/v0.10.0/com.brineandbuild.sonosoverlay_0.10.0_all.ipk",
   "ipkHash": {
-    "sha256": "e3c2df275dcb8417e80b325c47e8c8968a9cb3f881318bfd59d3e01e334c09a9"
+    "sha256": "f42af79e35abff9fa11e4bb4d57da0c1ba74b516bb257689ff9250eda1120ba6"
   },
-  "ipkSize": 138532
+  "ipkSize": 146742
 }

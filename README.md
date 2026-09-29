@@ -266,6 +266,10 @@ Written by the setup app to `/var/lib/com.brineandbuild.sonosoverlay/config.json
 | `sonosIp`, `sonosPort` | Player address; re-resolved by discovery if unreachable |
 | `sonosUuid`, `sonosName`, `sonosModel` | Used to re-find the player after a DHCP change |
 | `maxVolume` | Absolute ceiling on the Sonos scale (default 70) |
+| `showOnScreenVolume` | Show the TV's volume number (default on). Off skips the patch and the screen restart at boot |
+| `deferScreenRestart` | Hold the boot screen restart until no app is open (default off). For TVs that resume an app at power on |
+
+Both settings can be changed on the last screen of the setup app.
 
 ## Notes
 
