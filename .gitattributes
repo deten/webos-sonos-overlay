@@ -1,0 +1,7 @@
+# Everything here runs on the TV, which is Linux. A Windows checkout would
+# otherwise rewrite line endings to CRLF, and a shell script packaged that way
+# fails on the TV with "\r: not found".
+* text=auto eol=lf
+
+*.png binary
+*.ipk binary
