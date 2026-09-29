@@ -23,15 +23,27 @@ var renew                 = genaLib.renew;
 var unsubscribe           = genaLib.unsubscribe;
 var getVolume             = soapLib.getVolume;
 var setSonosVolume        = soapLib.setVolume;
+var getSonosMute          = soapLib.getMute;
 var getTransportState     = soapLib.getTransportState;
+var getSonosSource        = soapLib.getSource;
 var parseLastChange       = parseLib.parseLastChange;
 var openInputDevicesMulti = inputLib.openInputDevicesMulti;
 var detectInputDevice     = inputLib.detectInputDevice;
 var Correlator            = corrLib.Correlator;
 
 var EVENT_PATH        = '/MediaRenderer/RenderingControl/Event';
-var REQUESTED_TIMEOUT = 1800;
-var RENEW_FACTOR      = 0.80;
+
+// What the subscription is asked to last, and how often it is renewed.
+//
+// Measured on an Arc Ultra: a subscription to a host that has gone away
+// expires exactly on its timeout, so a shorter one is the window during which
+// the player keeps posting to a TV that has been switched off. A tester's Beam
+// answered as if it still held subscriptions 43 hours old, so on that firmware
+// the timeout may not be honoured at all, and the renewal interval doubles as
+// the check that ours is still alive: a player that restarts drops every
+// subscription, and we find out at the next renewal rather than 24 minutes on.
+var REQUESTED_TIMEOUT = 600;
+var RENEW_MAX_MS      = 300000;
 
 var DEFAULT_INPUT_DEV   = '/dev/input/event1';
 var DEFAULT_LISTEN_PORT = 7474;
@@ -72,6 +84,18 @@ var SLOW_PLAYER_MS = 1500;
 // run can tell roughly when this one stopped, which a killed process cannot
 // record for itself.
 var HEARTBEAT_MS = 60000;
+
+// Events arriving for a subscription this run did not create are left over
+// from an earlier run the TV powered off under. They are cancelled, but only
+// after this long, because the first event of our own new subscription can
+// arrive before the reply that tells us its ID.
+var FOREIGN_SID_GRACE_MS = 5000;
+
+// How long after a mute press to check whether it reached the soundbar.
+var MUTE_CHECK_MS = 1500;
+
+// How often the player's source is re-read even when nothing else changed.
+var SOURCE_CHECK_MS = 60000;
 
 // Connect retry backoff. The TV cold-boots on every power-on, so the service
 // always races Wi-Fi association and DHCP; a single attempt is not enough.
@@ -178,6 +202,19 @@ var state = {
   // tick, and the player can never rest on an odd number.
   lastKnownTv:    null,
   lastKnownSonos: null,
+
+  // What the TV and the player are doing beyond the volume number. These are
+  // the facts a report most often turns on: sound leaving the soundbar for the
+  // TV's own speakers, or the soundbar deciding it is playing music.
+  tvOutput:      null,   // external_arc, tv_speaker, ...
+  tvMuted:       null,
+  sonosSource:   null,   // tv | music | none
+  sourceCheckedAt: 0,
+  lanIp:         null,   // the address the player is posting events to
+  foreignSids:   {},     // sid -> true once a cancel has been scheduled
+  startedAt:     mono(),
+  connectedAt:   0,
+  lastRssMb:     0,
 };
 
 // ---------------------------------------------------------------------------
@@ -210,7 +247,17 @@ function note(msg, level) {
 function bump(key, by) { if (state.stats) state.stats.bump(key, by); }
 function peak(key, v)  { if (state.stats) state.stats.max(key, v); }
 
-function agoMs(t) { return t ? (Date.now() - t) : null; }
+// Milliseconds on a clock that only moves forward. The TV's wall clock is
+// wrong at power on and steps forward, sometimes by hours, once it syncs, which
+// made durations in the log nonsense ("last event 21219s ago" on a TV that had
+// been up for two) and could stall the settle timer outright if it ever
+// stepped back. Wall time is kept only for comparisons across reboots.
+function mono() {
+  var t = process.hrtime();
+  return t[0] * 1000 + Math.floor(t[1] / 1e6);
+}
+
+function agoMs(t) { return t ? (mono() - t) : null; }
 function agoStr(t) {
   var ms = agoMs(t);
   return ms === null ? 'never' : (ms < 10000 ? ms + 'ms' : Math.round(ms / 1000) + 's');
@@ -221,7 +268,9 @@ function agoStr(t) {
 // we get to knowing when the TV went off and whether it shut down properly.
 function reportPreviousSession(prev) {
   state.prevSession = prev && prev.sid ? prev : null;
-  if (!prev || !prev.startedAt) return;
+  // A run that never reached the player has no startedAt, only heartbeats,
+  // and still needs its ending recorded.
+  if (!prev || !(prev.startedAt || prev.lastSeenAt)) return;
 
   var endedAgo = prev.lastSeenAt
     ? Math.round((Date.now() - Date.parse(prev.lastSeenAt)) / 1000) : null;
@@ -267,10 +316,39 @@ async function probeStaleSubscription(device) {
 }
 
 // Written while alive so the next run can see roughly when this one stopped.
+// Also the once-a-minute check on two slow failures nothing else would notice.
 function startHeartbeat() {
   setInterval(function () {
-    if (!state.stats) return;
-    state.stats.setSession({ lastSeenAt: new Date().toISOString() }, true);
+    if (state.stats) {
+      state.stats.setSession({ lastSeenAt: new Date().toISOString() }, true);
+    }
+
+    // Memory. The service runs for hours at a time on a TV with little to
+    // spare, and a leak ends with the system killing it, which leaves no trace
+    // of its own. Recorded when it grows by a meaningful step.
+    var rssMb = Math.round(process.memoryUsage().rss / (1024 * 1024));
+    peak('max_rss_mb', rssMb);
+    if (rssMb >= state.lastRssMb + 10) {
+      if (state.lastRssMb) {
+        detail('memory: ' + state.lastRssMb + 'MB -> ' + rssMb + 'MB', 'info');
+      }
+      state.lastRssMb = rssMb;
+    }
+
+    // The TV's own address. The player posts events to the address we gave
+    // it when subscribing, so a DHCP change leaves it posting into the void
+    // while renewals keep succeeding and nothing looks wrong.
+    if (state.lanIp) {
+      var now = null;
+      try { now = detectLanIp(); } catch (e) { now = null; }
+      if (now && now !== state.lanIp) {
+        bump('lan_ip_changes');
+        note('the TV\'s network address changed, so the player is sending ' +
+             'events to the old one. Resubscribing at the new address.', 'warn');
+        state.lanIp = now;
+        if (state.config && !state.connecting) connectToSonos(state.config);
+      }
+    }
   }, HEARTBEAT_MS);
 }
 
@@ -306,7 +384,10 @@ function buildDiagnosticsReport() {
          (p.source ? '  (via ' + p.source + ')' : ''));
   L.push('model:         ' + (p.model || 'unknown') +
          (p.board ? '  [' + p.board + ']' : ''));
-  L.push('TV node:       ' + (p.node || 'unknown'));
+  L.push('TV node:       ' + (p.node || 'unknown') + ' ' + process.arch);
+  var up = tvUptimeSeconds();
+  L.push('TV uptime:     ' + (up === null ? 'unknown' : fmtDuration(up)) +
+         ', service ' + fmtDuration(Math.round((mono() - state.startedAt) / 1000)));
   L.push('compatibility: ' + (c.status || 'unknown').toUpperCase());
   L.push('               ' + (c.message || ''));
   if (c.status === 'untested' && c.testedOn) {
@@ -334,12 +415,22 @@ function buildDiagnosticsReport() {
   L.push('TV volume:      ' + state.tvVol);
   L.push('Sonos volume:   ' + state.sonosVol +
          '   (expected ' + (state.tvVol === null ? 'n/a' : tvToSonos(state.tvVol)) + ')');
+  L.push('last known:     TV ' + state.lastKnownTv + ', Sonos ' + state.lastKnownSonos +
+         (state.pendingTarget === null ? ''
+           : '   (moving the Sonos to ' + state.pendingTarget + ', ' +
+             agoStr(state.pendingSince) + ')'));
   L.push('ceiling:        ' + state.maxVolume + ' Sonos / ' + maxTvVol() + ' TV');
+  L.push('TV output:      ' + (state.tvOutput || 'unknown') +
+         (state.tvOutput && state.tvOutput !== 'external_arc'
+           ? '   (sound is NOT going to the soundbar)' : ''));
+  L.push('TV muted:       ' + state.tvMuted);
+  L.push('Sonos source:   ' + (state.sonosSource || 'unknown') +
+         (state.sonosSource === 'music' ? '   (not on the TV input)' : ''));
   L.push('transport:      ' + state.transportState);
   L.push('last key:       ' + (state.lastKeyAt
-    ? Math.round((Date.now() - state.lastKeyAt) / 1000) + 's ago' : 'none'));
+    ? Math.round((mono() - state.lastKeyAt) / 1000) + 's ago' : 'none'));
   L.push('last event:     ' + (state.lastGenaAt
-    ? Math.round((Date.now() - state.lastGenaAt) / 1000) + 's ago' : 'none this session'));
+    ? Math.round((mono() - state.lastGenaAt) / 1000) + 's ago' : 'none this session'));
   L.push('on-screen num:  ' +
     ((state.config && state.config.showOnScreenVolume === false)
       ? 'turned off in settings'
@@ -380,8 +471,27 @@ function summaryLines() {
   row('sessions',        n('sessions'));
   row('clean shutdowns', n('clean_exits'),
       n('sessions') > 1 ? '(of ' + (n('sessions') - 1) + ' ended)' : '');
+  row('crashes',         n('crashes'),      'the service died on an error');
+  row('unhandled errors', n('unhandled_rejections'));
+  row('connect failures', n('connect_failures'), 'attempts to reach the player');
+  L.push('');
   row('stale subs found', n('stale_subs_alive'),
       'subscriptions the player still held at the next start');
+  row('leftover subs',   n('foreign_subs'),
+      'events arriving for a subscription this run did not create');
+  row('  cancelled',     n('foreign_subs_cancelled'));
+  row('sub replaced',    n('sub_replaced'),
+      'another subscriber took this TV\'s address');
+  row('renew failures',  n('renew_failures'),
+      'the player had dropped our subscription');
+  row('resub failures',  n('resub_failures'), 'event feed lost and rebuilt');
+  L.push('');
+  row('output changes',  n('output_changes'),
+      'TV sound moved on or off the soundbar');
+  row('source changes',  n('source_changes'),
+      'soundbar switched between TV and music');
+  row('mute mismatches', n('mute_mismatch'),
+      'mute on the TV did not reach the soundbar');
   L.push('');
   row('key bursts',      n('bursts'));
   row('keys pressed',    n('keys'));
@@ -395,6 +505,10 @@ function summaryLines() {
       'player reports treated as lag, not as someone else');
   row('gave up',         n('pending_abandoned'),
       'instructions the player never reached');
+  row('TV led',          n('tv_led'),       'TV changed without a remote press');
+  row('player led',      n('player_led'),   'player changed, found by polling');
+  row('write failures',  n('write_failures'));
+  row('read failures',   n('read_failures'));
   L.push('');
   row('screen restarts', n('compositor_restarts'));
   row('  deferred',      n('restarts_deferred'),
@@ -403,12 +517,18 @@ function summaryLines() {
   row('events received', n('events'));
   row('event gaps',      n('event_gaps'),
       'player volume moved with no event sent');
-  row('longest gap',     n('max_gena_gap_s') + 's',
-      'between events while the TV was awake');
-  row('renew failures',  n('renew_failures'));
+  row('  healed',        n('gap_resubscribes'),
+      'fresh subscriptions taken because of one');
+  row('sequence gaps',   n('seq_gaps'),     'events the player sent that never arrived');
+  row('longest quiet',   n('max_gena_gap_s') + 's',
+      'between events; long is normal when nothing changes');
   row('resubscribes',    n('resubscribes'));
   row('slow responses',  n('slow_player'),  'over ' + SLOW_PLAYER_MS + 'ms');
   row('slowest response', n('max_player_ms') + 'ms');
+  L.push('');
+  row('input restarts',  n('input_restarts'), 'remote reader died and came back');
+  row('address changes', n('lan_ip_changes'), 'the TV moved on the network');
+  row('peak memory',     n('max_rss_mb') + 'MB');
 
   var prev = state.stats.prevSession();
   if (prev && prev.lastSeenAt) {
@@ -605,10 +725,12 @@ function closeSetupApp() {
 // It starts the service and nothing else. Everything about the screen is now
 // decided by the service, which can see what is in front of it.
 function bootHookScript() {
+  function open(p) {
+    var rule = 'INPUT -p tcp --dport ' + p + ' -j ACCEPT';
+    return 'iptables -C ' + rule + ' 2>/dev/null || iptables -I ' + rule + ' 2>/dev/null\n';
+  }
   return '#!/bin/sh\n' +
-    'iptables -I INPUT -p tcp --dport ' + DEFAULT_LISTEN_PORT + ' -j ACCEPT 2>/dev/null\n' +
-    'iptables -I INPUT -p tcp --dport ' + DEFAULT_WS_PORT + ' -j ACCEPT 2>/dev/null\n' +
-    'iptables -I INPUT -p tcp --dport ' + API_PORT + ' -j ACCEPT 2>/dev/null\n' +
+    open(DEFAULT_LISTEN_PORT) + open(DEFAULT_WS_PORT) + open(API_PORT) +
     // Only wait if there was something to kill; at boot there never is, and
     // the wait was costing a second of every power-on.
     'if pkill -f \'tv-service.bundle.js\' 2>/dev/null; then sleep 1; fi\n' +
@@ -655,9 +777,12 @@ function saveConfig(cfg) {
 // ---------------------------------------------------------------------------
 // iptables: open ports silently; errors are non-fatal
 // ---------------------------------------------------------------------------
+// Checked before inserting. Inserting unconditionally added three more
+// identical rules on every start; one TV had seventeen by the evening.
 function openPorts() {
   [DEFAULT_LISTEN_PORT, DEFAULT_WS_PORT, API_PORT].forEach(function(p) {
-    cp.exec('iptables -I INPUT -p tcp --dport ' + p + ' -j ACCEPT 2>/dev/null');
+    var rule = 'INPUT -p tcp --dport ' + p + ' -j ACCEPT';
+    cp.exec('iptables -C ' + rule + ' 2>/dev/null || iptables -I ' + rule + ' 2>/dev/null');
   });
 }
 
@@ -818,11 +943,27 @@ function startApiServer() {
         var overlayChanged = ('showOnScreenVolume' in body) &&
                              body.showOnScreenVolume !== prev.showOnScreenVolume;
 
+        // A different speaker must not inherit the old one's identity. The
+        // UUID is what rediscovery matches on after the network moves, so a
+        // stale one would quietly reconnect to the speaker being replaced.
+        if (playerChanged && prev.sonosIp && !('sonosUuid' in body)) {
+          delete merged.sonosUuid;
+          delete merged.sonosModel;
+          detail('player changed, forgetting the previous player\'s identity');
+        }
+
         saveConfig(merged);
         state.config = merged;
 
         if (overlayChanged) {
           if (merged.showOnScreenVolume === false) {
+            // A restart still being held for a free screen would otherwise
+            // fire later and blank the screen for a number that is now off.
+            if (state.overlayRestartTimer) {
+              clearTimeout(state.overlayRestartTimer);
+              state.overlayRestartTimer = null;
+            }
+            state.overlayDeferredFor = null;
             // Unmounting now leaves the next compositor start clean. The
             // number keeps showing until then, which is harmless.
             cp.exec('umount "' + QML_PATH + '" 2>/dev/null', function () {});
@@ -1007,6 +1148,7 @@ async function connectToSonos(config, attempt) {
 
     var callbackIp  = args.callbackIp || detectLanIp();
     var callbackUrl = 'http://' + callbackIp + ':' + DEFAULT_LISTEN_PORT + '/notify';
+    state.lanIp = callbackIp;
 
     console.log('[main] Sonos:    ', device.ip + ':' + device.port);
     console.log('[main] callback: ', callbackUrl);
@@ -1080,16 +1222,40 @@ async function connectToSonos(config, attempt) {
         ? detected.candidates.map(function(c) { return c.path; })
         : [DEFAULT_INPUT_DEV];
       console.log('[input] listening on', devPaths.length, 'device(s):', devPaths.join(', '));
+      detail('input: listening on ' + devPaths.length + ' device(s), ' +
+             detected.candidates.filter(function (c) { return c.hasVolKeys; }).length +
+             ' declaring volume keys');
       state.inputHandle = openInputDevicesMulti(devPaths, onInputEvent, function(err) {
         console.error('[input] fatal:', err.message);
         if (state.diag) state.diag.error('input reader fatal: ' + err.message);
+      }, function (level, msg) {
+        bump('input_restarts');
+        detail(msg, level);
       });
     }
+
+    // How long it took to become useful after power on, and how many tries.
+    // A report of "I have to wait before it works" is this number.
+    state.connectedAt = mono();
+    var up = tvUptimeSeconds();
+    (attempt > 0 ? note : detail)(
+      'ready: connected to ' + (config.sonosModel || 'the player') +
+      (up === null ? '' : ' ' + up + 's after power on') +
+      ', ' + Math.round((mono() - state.startedAt) / 1000) +
+      's after the service started' +
+      (attempt > 0 ? ', after ' + (attempt + 1) + ' attempts' : ''), 'info');
 
     console.log('\n[main] ready, press Vol+/Vol−/Mute on the remote.\n');
   } catch (e) {
     console.error('[main] connect failed (attempt ' + (attempt + 1) + '):', e.message);
-    if (state.diag) {
+    bump('connect_failures');
+    // The first failure of a streak is worth keeping; the rest are counted.
+    if (attempt === 0) {
+      note('could not reach the player (' + e.message + '), retrying' +
+           (tvUptimeSeconds() === null ? ''
+                                       : ', ' + tvUptimeSeconds() + 's after power on'),
+           'warn');
+    } else if (state.diag) {
       state.diag.change('connect-fail', e.message,
         'connect to Sonos failed: ' + e.message);
     }
@@ -1107,7 +1273,7 @@ async function connectToSonos(config, attempt) {
 // /dev/input event handler
 // ---------------------------------------------------------------------------
 function onInputEvent(event) {
-  state.lastKeyAt = Date.now();
+  state.lastKeyAt = mono();
   recordKeyInBurst(event);
   var label = event.value === 1 ? 'down  ' : 'repeat';
   console.log('[input]', label, 'dir=' + event.direction,
@@ -1126,7 +1292,7 @@ function onInputEvent(event) {
 function recordKeyInBurst(event) {
   if (!state.burst) {
     state.burst = {
-      startedAt: Date.now(),
+      startedAt: mono(),
       tvBefore:  state.tvVol,
       arcBefore: state.sonosVol,
       keys:      0,
@@ -1139,7 +1305,7 @@ function recordKeyInBurst(event) {
   b.keys++;
   if (event.value === 2) b.repeats++;
   b.dirs[event.direction] = (b.dirs[event.direction] || 0) + 1;
-  b.lastAt = Date.now();
+  b.lastAt = mono();
   bump('keys');
 }
 
@@ -1168,12 +1334,46 @@ function closeBurst(wrote) {
 function onVolumeKey(direction) {
   if (direction === 'mute') {
     state.optimisticMuted = !state.optimisticMuted;
+    checkMuteReached();
     return;
   }
   scheduleSettle();
 }
 
-function settled() { return (Date.now() - state.lastKeyAt) > SETTLE_MS; }
+// Nothing here forwards mute to the soundbar; that is left to CEC. On a TV
+// where CEC does not carry volume to the soundbar, it probably does not carry
+// mute either, and the TV would go silent on screen while the soundbar keeps
+// playing. This records whether the two agree shortly after each press.
+function checkMuteReached() {
+  if (state.muteCheckTimer) clearTimeout(state.muteCheckTimer);
+  state.muteCheckTimer = setTimeout(function () {
+    state.muteCheckTimer = null;
+    if (!state.device) return;
+    readTvVolume(function () {
+      getSonosMute(state.device).then(function (arcMuted) {
+        var tvMuted = state.tvMuted;
+        if (tvMuted === null) {
+          detail('mute pressed: Arc muted=' + arcMuted + ', TV mute state unknown');
+          return;
+        }
+        if (tvMuted === arcMuted) {
+          detail('mute pressed: TV and Arc agree, muted=' + arcMuted);
+          return;
+        }
+        bump('mute_mismatch');
+        note('MUTE: pressed mute, TV muted=' + tvMuted + ' but Arc muted=' +
+             arcMuted + ' ' + Math.round(MUTE_CHECK_MS / 1000 * 10) / 10 +
+             's later. Mute is not reaching the soundbar over HDMI.');
+      }).catch(function (e) {
+        detail('mute pressed, could not read the Arc mute state: ' + e.message, 'warn');
+      });
+    });
+  }, MUTE_CHECK_MS);
+}
+
+function settled() {
+  return !state.lastKeyAt || (mono() - state.lastKeyAt) > SETTLE_MS;
+}
 
 // Clamp anything bound for the Sonos to the configured ceiling.
 function clampVol(v) {
@@ -1190,14 +1390,40 @@ function maxTvVol() { return Math.floor(state.maxVolume / TV_TO_SONOS_RATIO); }
 function refreshTransportState() {
   if (!state.device) return;
   getTransportState(state.device).then(function(ts) {
-    if (ts && ts !== state.transportState) {
+    var changed = ts && ts !== state.transportState;
+    if (changed) {
       console.log('[arc] transport state:', state.transportState, '->', ts);
       // Worth recording: a report of the app showing the wrong thing is much
       // easier to read against what the player was actually saying at the time.
       detail('transport: ' + state.transportState + ' -> ' + ts);
     }
     if (ts) state.transportState = ts;
+
+    // The source is re-read when playback changes, and otherwise once a minute.
+    if (changed || agoMs(state.sourceCheckedAt) > SOURCE_CHECK_MS) {
+      refreshSource();
+    }
   }).catch(function() {});
+}
+
+// Whether the soundbar thinks it is carrying TV audio or playing music. When
+// the app shows music while the TV is playing, this is what the player itself
+// was saying at the time, which separates a Sonos display quirk from the
+// soundbar genuinely having switched away from the TV.
+function refreshSource() {
+  if (!state.device) return;
+  state.sourceCheckedAt = mono();
+  getSonosSource(state.device).then(function (src) {
+    if (!src || src === state.sonosSource) return;
+    var prev = state.sonosSource;
+    state.sonosSource = src;
+    if (prev === null) { detail('Arc source: ' + src); return; }
+    bump('source_changes');
+    (src === 'tv' || prev === 'tv' ? note : detail)(
+      'Arc source changed: ' + prev + ' -> ' + src +
+      ' | TV output ' + (state.tvOutput || 'unknown') +
+      ', transport ' + (state.transportState || 'unknown'), 'info');
+  }).catch(function () {});
 }
 
 // After the remote goes quiet, take the Sonos at its word. This is the only
@@ -1239,9 +1465,9 @@ function reconcileTvAndSonos(reason) {
       state.tvVol = tvCap;
     }
 
-    var askedAt = Date.now();
+    var askedAt = mono();
     getVolume(state.device).then(function(sonosVol) {
-      recordPlayerLatency(Date.now() - askedAt);
+      recordPlayerLatency(mono() - askedAt);
       checkForMissedEvent(sonosVol);
 
       // Which side moved since we last looked. This is the whole arbitration:
@@ -1257,7 +1483,7 @@ function reconcileTvAndSonos(reason) {
       if (reason === 'settle') {
         // The remote was used. That is an instruction, and the TV leads.
         state.pendingTarget = clampVol(tvToSonos(state.tvVol));
-        state.pendingSince  = Date.now();
+        state.pendingSince  = mono();
       } else if (state.pendingTarget !== null &&
                  state.pendingTarget === sonosVol) {
         // Reached. Checked before expiry, because the sync interval is longer
@@ -1286,7 +1512,7 @@ function reconcileTvAndSonos(reason) {
                ' with no keypress, moving the player to match');
         bump('tv_led');
         state.pendingTarget = clampVol(tvToSonos(state.tvVol));
-        state.pendingSince  = Date.now();
+        state.pendingSince  = mono();
       } else if (state.pendingTarget === null && sonosMoved) {
         // The player moved and the TV did not: someone used the Sonos app, or
         // another device in the household. Show it on the TV and leave the
@@ -1336,7 +1562,7 @@ function reconcileTvAndSonos(reason) {
       console.log('[settle] TV', state.tvVol, '(wants Arc ' + tvToSonos(state.tvVol) + ')',
         '| Arc', sonosVol, '-> setting Arc to', target);
       state.pendingSonosWrite = target;
-      state.lastWriteAt  = Date.now();
+      state.lastWriteAt  = mono();
       state.lastWriteVal = target;
       // Recorded as intended, so the echo does not read as the player moving
       // by itself on the next tick. A failed write leaves the instruction
@@ -1361,7 +1587,7 @@ function reconcileTvAndSonos(reason) {
         }
       });
     }).catch(function(e) {
-      recordPlayerLatency(Date.now() - askedAt);
+      recordPlayerLatency(mono() - askedAt);
       bump('read_failures');
       if (state.diag) {
         state.diag.change('getvol-fail', e && e.message,
@@ -1396,9 +1622,23 @@ function checkForMissedEvent(polledVol) {
   if (newEvents > 0) return;   // it did tell us, we simply polled as well
 
   bump('event_gaps');
+
+  // A gap is proof the subscription is not delivering. On the development TV
+  // this happened 31 times in a week of ordinary use, with the feed dead for
+  // hours at a time and nobody noticing, because polling kept the volume
+  // right. Taking a fresh subscription costs one request and replaces the
+  // silent one, so do it rather than wait for the next renewal to fail.
+  var heal = state.sid && state.device && state.callbackUrl &&
+             (!state.lastGapHealAt || agoMs(state.lastGapHealAt) > 60000);
   note('EVENT GAP: player volume moved ' + believed + ' -> ' + polledVol +
        ' and no event was sent (last event ' + agoStr(state.lastGenaAt) +
-       ', our last write ' + agoStr(state.lastWriteAt) + ')');
+       ', our last write ' + agoStr(state.lastWriteAt) + ')' +
+       (heal ? '. Taking a fresh subscription.' : ''));
+  if (heal) {
+    state.lastGapHealAt = mono();
+    bump('gap_resubscribes');
+    resubscribeNow('events stopped arriving');
+  }
 }
 
 // Did the player actually end up where we asked? Skipped when the user has
@@ -1457,7 +1697,16 @@ function reconcile(genaVol, genaMuted) {
   // Nothing we did, and no key was pressed: someone moved it in the Sonos app.
   // Adopt it into the TV rather than reverting it, so app control keeps working
   //, otherwise TV-leads would silently undo every change made from a phone.
-  if (state.tvVol !== null && genaVol !== tvToSonos(state.tvVol)) {
+  //
+  // Judged by whether the player actually moved since we last recorded it,
+  // not by whether it equals twice the TV. With the player resting on an odd
+  // value, the old comparison fired on every event that carried the volume,
+  // re-adopting the same number and redrawing the TV's volume display each time.
+  var moved = state.lastKnownSonos === null
+    ? genaVol !== tvToSonos(state.tvVol)
+    : genaVol !== state.lastKnownSonos;
+
+  if (state.tvVol !== null && moved) {
     // An instruction of ours is still outstanding, so this is the player
     // catching up, not a person. Adopting here is what dragged the TV down to
     // half a lagging player's value part way through a held button.
@@ -1489,8 +1738,9 @@ function reconcile(genaVol, genaMuted) {
     // deliberately not followed by writing twice this value back to the
     // player: that is what turned a nudge to 9 into 10, and undid a nudge
     // down to 9 completely. The player keeps what it was given, odd or not.
+    // Skipped when the TV already shows it, since every write draws the OSD.
+    if (adopted !== state.tvVol) pushTvVolume(adopted);
     state.tvVol = adopted;
-    pushTvVolume(adopted);
 
     // Both sides recorded as intended, so the sync tick that follows does not
     // see our own display update as the TV moving and push the player back.
@@ -1502,13 +1752,30 @@ function reconcile(genaVol, genaMuted) {
 // ---------------------------------------------------------------------------
 // GENA NOTIFY handler
 // ---------------------------------------------------------------------------
-function onGenaNotify(headers, rawBody, recvAt) {
+function onGenaNotify(headers, rawBody, recvAt, fromIp) {
   var sid = headers['sid'] || '';
   var seq = parseInt(headers['seq'] || '0', 10);
 
+  // A subscription this run did not create. Every earlier run that the TV
+  // powered off under left one of these on the player, pointing at this same
+  // address, and the player keeps posting to all of them. Their data is not
+  // ours to act on (it may even be a different speaker, from before a
+  // reconfigure), so it is recorded and cancelled rather than processed.
+  if (sid && sid !== state.sid) {
+    handleForeignSid(sid, seq, fromIp);
+    return;
+  }
+
   if (sid === state.sid) {
-    if (seq !== state.seqExpected && !(seq === 0 && state.seqExpected > 0))
+    if (seq !== state.seqExpected && !(seq === 0 && state.seqExpected > 0)) {
       console.warn('[gena] SEQ gap: expected', state.seqExpected, 'got', seq);
+      // A gap means the player sent events we never received. Rare on a LAN,
+      // so worth knowing about when it happens.
+      bump('seq_gaps');
+      detail('event sequence gap: expected ' + state.seqExpected + ', got ' +
+             seq + ', so ' + Math.max(0, seq - state.seqExpected) +
+             ' event(s) from the player never arrived', 'warn');
+    }
     state.seqExpected = seq + 1;
   }
 
@@ -1533,12 +1800,83 @@ function onGenaNotify(headers, rawBody, recvAt) {
     // Gap between events, measured only while we already had one, so an idle
     // overnight stretch does not count as the player having gone quiet.
     if (state.lastGenaAt) peak('max_gena_gap_s', Math.round(agoMs(state.lastGenaAt) / 1000));
-    state.lastGenaAt = Date.now();
+    state.lastGenaAt = mono();
     state.genaCount++;
     bump('events');
     if (state.correlator) state.correlator.recordGena(masterVol, muted, recvAt);
     broadcastVolume(masterVol, muted);
   }
+}
+
+// Schedules the cancel of a subscription we did not create, once per SID.
+//
+// The wait matters: the first event of a subscription we have just taken can
+// arrive before the reply carrying its ID has been processed, and cancelling
+// that would silently cut our own event feed. So the decision is re-checked
+// after a grace period, by which time our own ID is always known.
+//
+// What it means depends on the player, and the two cases need opposite
+// responses:
+//
+//   - Our own subscription is still alive. Then this one is a leftover the
+//     player is keeping alongside it, which is what a player that never
+//     expires old subscriptions would do. Cancel it.
+//   - Ours is gone. An Arc Ultra keeps one subscription per callback address,
+//     so anything subscribing with our address silently replaces ours, and
+//     this is the replacement. Cancelling it would leave us with nothing, so
+//     take the address back instead.
+//
+// Renewing ours answers which case it is, and costs one request.
+function handleForeignSid(sid, seq, fromIp) {
+  if (state.foreignSids[sid]) return;
+  state.foreignSids[sid] = true;
+
+  setTimeout(function () {
+    if (sid === state.sid) {
+      // It was ours after all, just faster than the subscribe reply.
+      delete state.foreignSids[sid];
+      return;
+    }
+    bump('foreign_subs');
+
+    var otherPlayer = fromIp && state.device && fromIp !== state.device.ip;
+    var host = fromIp ? { ip: fromIp, port: 1400 } : state.device;
+    if (!host) return;
+
+    // From a player we are no longer configured for, typically left over from
+    // before the speaker was changed in setup. Nothing of ours is on that
+    // player, so it can simply be cancelled.
+    if (otherPlayer || !state.sid) {
+      cancelForeign(host, sid, seq,
+        otherPlayer ? 'from a different player than the configured one'
+                    : 'while this run held no subscription');
+      return;
+    }
+
+    renew(state.device, state.sid, EVENT_PATH, REQUESTED_TIMEOUT).then(function () {
+      cancelForeign(host, sid, seq,
+        'alongside our own, which is still alive, so the player is keeping ' +
+        'old subscriptions rather than replacing them');
+    }).catch(function (e) {
+      bump('sub_replaced');
+      note('SUB REPLACED: our subscription is gone (' + e.message + ') and ' +
+           'another one is using this TV\'s address (event #' + seq + '). ' +
+           'Something else subscribed with our address. Taking it back.', 'warn');
+      resubscribeNow('our subscription was replaced');
+    });
+  }, FOREIGN_SID_GRACE_MS);
+}
+
+function cancelForeign(host, sid, seq, why) {
+  genaLib.unsubscribeStatus(host, sid, EVENT_PATH).then(function (res) {
+    if (res.statusCode === 200) bump('foreign_subs_cancelled');
+    note('LEFTOVER SUB: events arriving for a subscription this run did not ' +
+         'create, ' + why + ' (event #' + seq + '). Cancelled it (HTTP ' +
+         res.statusCode + ').');
+  }).catch(function (e) {
+    note('LEFTOVER SUB: found one but could not cancel it: ' + e.message, 'warn');
+    delete state.foreignSids[sid];   // try again if it keeps arriving
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,6 +1893,8 @@ function pushTvVolume(vol) {
 }
 
 // Read the TV's stored volume. cb(number|null), never throws.
+// The same reply carries the sound output and mute state, which are recorded
+// on the way past because they cost nothing extra to read.
 function readTvVolume(cb) {
   cp.exec(
     '/usr/bin/luna-send -n 1 -f luna://com.webos.service.audio/master/getVolume \'{}\' 2>/dev/null',
@@ -1563,11 +1903,34 @@ function readTvVolume(cb) {
       if (err) { cb(null); return; }
       try {
         var parsed = JSON.parse(stdout);
-        var v = parsed && parsed.volumeStatus ? parsed.volumeStatus.volume : null;
-        cb(typeof v === 'number' ? v : null);
+        var vs = (parsed && parsed.volumeStatus) || {};
+        noteTvOutput(vs.soundOutput);
+        if (typeof vs.muteStatus === 'boolean') state.tvMuted = vs.muteStatus;
+        cb(typeof vs.volume === 'number' ? vs.volume : null);
       } catch (e) { cb(null); }
     }
   );
+}
+
+// The TV quietly moving its sound off the soundbar is the most likely single
+// explanation for "the Sonos stopped responding", and nothing else records it.
+function noteTvOutput(out) {
+  if (!out || out === state.tvOutput) return;
+  var prev = state.tvOutput;
+  state.tvOutput = out;
+  if (prev === null) {
+    detail('TV sound output: ' + out +
+           (out === 'external_arc' ? '' : ', not the soundbar'));
+    if (out !== 'external_arc') bump('output_not_arc_at_start');
+    return;
+  }
+  bump('output_changes');
+  note('TV sound output changed: ' + prev + ' -> ' + out +
+       (out === 'external_arc'
+         ? ', back on the soundbar'
+         : ', sound is no longer going to the soundbar') +
+       ' | Arc source ' + (state.sonosSource || 'unknown') +
+       ', transport ' + (state.transportState || 'unknown'));
 }
 
 function broadcastVolume(vol, muted) {
@@ -1591,7 +1954,8 @@ function broadcastVolume(vol, muted) {
 // ---------------------------------------------------------------------------
 function scheduleRenew(device, callbackUrl, negotiatedSeconds) {
   if (state.renewTimer) clearTimeout(state.renewTimer);
-  var delayMs = Math.floor(negotiatedSeconds * RENEW_FACTOR * 1000);
+  state.callbackUrl = callbackUrl;
+  var delayMs = Math.min(Math.floor(negotiatedSeconds * 1000 / 2), RENEW_MAX_MS);
   console.log('[gena] renewal in', Math.round(delayMs / 1000) + 's');
 
   state.renewTimer = setTimeout(async function() {
@@ -1602,23 +1966,43 @@ function scheduleRenew(device, callbackUrl, negotiatedSeconds) {
     } catch (e) {
       console.error('[gena] renew failed:', e.message, ', re-subscribing...');
       bump('renew_failures');
-      note('renew failed (' + e.message + '), re-subscribing', 'warn');
-      try {
-        var sub = await subscribe(device, callbackUrl, EVENT_PATH, REQUESTED_TIMEOUT);
-        state.sid = sub.sid; state.seqExpected = 0;
-        console.log('[gena] re-subscribed SID:', sub.sid);
-        bump('resubscribes');
-        if (state.stats) state.stats.setSession({ sid: sub.sid }, true);
-        scheduleRenew(device, callbackUrl, sub.negotiatedSeconds);
-      } catch (e2) {
-        console.error('[gena] re-subscribe failed:', e2.message);
-        if (state.diag) {
-          state.diag.change('resub-fail', e2.message,
-            'GENA re-subscribe failed: ' + e2.message);
-        }
-      }
+      // A 412 here means the player no longer knows our subscription at all.
+      // Usually the player restarted, which drops every subscription it held.
+      note('the player no longer had our subscription (' + e.message + '). ' +
+           'It probably restarted. Taking a new one.', 'warn');
+      resubscribeNow('renewal failed');
     }
   }, delayMs);
+}
+
+// Take a fresh subscription on the configured player, replacing ours.
+// Because the player keeps only one subscription per callback address, this
+// also displaces anything else that had taken our address.
+async function resubscribeNow(reason) {
+  if (!state.device || !state.callbackUrl) return;
+  try {
+    var sub = await subscribe(state.device, state.callbackUrl, EVENT_PATH, REQUESTED_TIMEOUT);
+    state.sid = sub.sid; state.seqExpected = 0;
+    console.log('[gena] re-subscribed SID:', sub.sid);
+    bump('resubscribes');
+    detail('re-subscribed (' + reason + '), timeout ' + sub.negotiatedSeconds + 's');
+    if (state.stats) state.stats.setSession({ sid: sub.sid }, true);
+    scheduleRenew(state.device, state.callbackUrl, sub.negotiatedSeconds);
+  } catch (e2) {
+    console.error('[gena] re-subscribe failed:', e2.message);
+    // This used to be the end of the road: no renewal was scheduled, so
+    // events stopped for the rest of the session while the report still said
+    // subscribed. Most often it means the player moved address, so start
+    // over from discovery rather than retrying a dead one.
+    bump('resub_failures');
+    note('lost the event subscription and could not take a new one (' +
+         e2.message + '). Reconnecting from scratch in 30s.', 'error');
+    state.sid = null;
+    if (state.retryTimer) clearTimeout(state.retryTimer);
+    state.retryTimer = setTimeout(function () {
+      if (state.config) connectToSonos(state.config);
+    }, 30000);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1627,7 +2011,10 @@ function scheduleRenew(device, callbackUrl, negotiatedSeconds) {
 // ---------------------------------------------------------------------------
 function startPeriodicSync() {
   setInterval(function() {
-    if (!state.device || !state.correlator || !state.sid) return;
+    // Deliberately not gated on the event subscription. Volume sync is plain
+    // request and reply and works without one; tying it to the subscription
+    // meant losing events silently took volume sync down with it.
+    if (!state.device) return;
     refreshTransportState();
     // Never correct while a keypress burst is still settling.
     if (!settled()) return;
@@ -1703,6 +2090,19 @@ function detectLanIp() {
   throw new Error('Cannot detect LAN IP');
 }
 
+function fmtDuration(s) {
+  if (s === null || s === undefined) return 'unknown';
+  if (s < 120) return s + 's';
+  if (s < 7200) return Math.round(s / 60) + 'm';
+  return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
+}
+
+function tvUptimeSeconds() {
+  try {
+    return Math.round(parseFloat(fs.readFileSync('/proc/uptime', 'utf8').split(' ')[0]));
+  } catch (e) { return null; }
+}
+
 function delay(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
 function pad6(n)   { var s = String(n); while (s.length < 6) s = '0' + s; return s; }
 
@@ -1756,23 +2156,69 @@ function runProbes(cb) {
 }
 
 // ---------------------------------------------------------------------------
+// Crashes. The boot hook starts the service once per power on, so a crash
+// means no volume sync until the next one, and without this nothing about it
+// would survive: the runtime log is on a ramfs and the process is gone.
+function installCrashHandlers() {
+  process.on('uncaughtException', function (err) {
+    bump('crashes');
+    note('CRASH: ' + ((err && err.stack) || String(err)).split('\n').slice(0, 6).join(' | '),
+         'error');
+    if (state.stats) state.stats.flush(true);
+    process.exit(1);
+  });
+  process.on('unhandledRejection', function (reason) {
+    // Not fatal, but each one is a code path that failed without handling it.
+    bump('unhandled_rejections');
+    if (state.diag) {
+      state.diag.change('rejection', String(reason && reason.message),
+        'unhandled rejection: ' +
+        ((reason && reason.stack) || String(reason)).split('\n').slice(0, 4).join(' | '));
+    }
+  });
+}
+
+// A second copy started while one is already running cannot bind the ports.
+// It used to crash on that; now it says so and steps aside cleanly.
+function exitIfPortTaken(server, name) {
+  server.on('error', function (e) {
+    if (e && e.code === 'EADDRINUSE') {
+      note('another copy of the service already holds the ' + name +
+           ' port, so this one is exiting and leaving it running', 'info');
+      process.exit(0);
+    }
+    note(name + ' server error: ' + (e && e.message), 'error');
+  });
+}
+
 async function main() {
   state.diag    = new diagLib.DiagLog(DIAG_FILE,    { maxBytes: 128 * 1024 });
   state.notable = new diagLib.DiagLog(NOTABLE_FILE, { maxBytes: 32 * 1024 });
   state.stats   = new statsLib.Stats(STATS_FILE);
+  installCrashHandlers();
 
-  // Whatever the last run left behind, before this one overwrites it.
-  var prev = state.stats.rotateSession();
-  state.stats.bump('sessions');
+  // Registered first, not last. They used to be installed only after the
+  // connect finished, which can take a minute of retries, and a stop signal
+  // arriving before then skipped the unsubscribe and left one more stale
+  // subscription on the player.
+  process.on('SIGINT',  function () { shutdown('SIGINT'); });
+  process.on('SIGTERM', function () { shutdown('SIGTERM'); });
 
   state.platform = compatLib.readPlatform();
   state.compat   = compatLib.checkPlatform(state.platform);
 
   state.diag.info('--- service start, v' + pkg.version + ' ---');
-  reportPreviousSession(prev);
   state.diag.info('platform: webOS ' + (state.platform.release || 'unknown') +
     ' on ' + (state.platform.model || 'unknown model') +
-    ', node ' + state.platform.node);
+    ', node ' + state.platform.node + ' ' + process.arch +
+    ', started ' + (tvUptimeSeconds() === null ? '?' : tvUptimeSeconds()) +
+    's after power on');
+  // The keypress reader assumes a 16 byte input event, which is only true of
+  // 32-bit userspace. A 64-bit TV would read garbage and see no keys at all.
+  if (process.arch === 'arm64' || process.arch === 'x64') {
+    note('this TV runs a 64-bit node (' + process.arch + '). The remote reader ' +
+         'expects 32-bit input events and will probably see no key presses.', 'warn');
+  }
   state.diag.write(state.compat.status === 'tested' ? 'info' : 'warn',
     'compatibility: ' + state.compat.status + ', ' + state.compat.message);
 
@@ -1786,10 +2232,29 @@ async function main() {
 
   // Start infrastructure servers first
   state.server = startListener(DEFAULT_LISTEN_PORT, onGenaNotify);
+  exitIfPortTaken(state.server, 'event');
   state.wss    = new WebSocketServer({ port: DEFAULT_WS_PORT });
   state.wss.on('listening', function() { console.log('[ws]   overlay server on :' + DEFAULT_WS_PORT); });
-  state.wss.on('error', function(e)   { console.error('[ws]   server error:', e.message); });
+  state.wss.on('error', function(e)   {
+    console.error('[ws]   server error:', e.message);
+    detail('overlay socket server error: ' + e.message, 'warn');
+  });
   startApiServer();
+  exitIfPortTaken(state.apiServer, 'setup');
+
+  // Only once the ports are ours. A duplicate copy exits above, and must do
+  // so without touching the session record: rotating it would throw away the
+  // running copy's subscription ID, which the next boot needs to cancel it.
+  await new Promise(function (resolve) {
+    if (state.apiServer.listening) { resolve(); return; }
+    state.apiServer.once('listening', resolve);
+    setTimeout(resolve, 3000);
+  });
+
+  // Whatever the last run left behind, before this one overwrites it.
+  var prev = state.stats.rotateSession();
+  state.stats.bump('sessions');
+  reportPreviousSession(prev);
 
   await delay(150);
 
@@ -1814,13 +2279,13 @@ async function main() {
   startPeriodicSync();
   startHeartbeat();
   runProbes(null);
-
-  process.on('SIGINT',  function () { shutdown('SIGINT'); });
-  process.on('SIGTERM', function () { shutdown('SIGTERM'); });
 }
 
 main().catch(function(err) {
   console.error('[fatal]', err.message);
-  if (state.diag) state.diag.error('fatal: ' + err.message);
+  bump('crashes');
+  note('fatal during startup: ' +
+       ((err && err.stack) || String(err)).split('\n').slice(0, 6).join(' | '), 'error');
+  if (state.stats) state.stats.flush(true);
   process.exit(1);
 });
