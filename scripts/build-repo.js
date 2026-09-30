@@ -143,5 +143,7 @@ console.log('  ipk expected at       : ' + manifest.ipkUrl);
 console.log('  sha256                : ' + sha256);
 console.log('  upload asset          : dist/' + ipkName);
 console.log('');
+// Homebrew Channel fetches the address exactly as entered and does not add a
+// filename to a folder, so the address people type has to be the JSON itself.
 console.log('Add this URL in Homebrew Channel > Settings > Add repository:');
-console.log('  ' + REPO_BASE);
+console.log('  ' + REPO_BASE + 'apps.json');

@@ -43,10 +43,11 @@ below gives you the same package: the service, the overlay, and the setup app.
 Recommended. Homebrew Channel then handles updates for you.
 
 1. On the TV, open **Homebrew Channel** and go to **Settings**.
-2. Choose **Add repository** and enter:
+2. Choose **Add repository** and enter the full address, including
+   `apps.json` at the end:
 
    ```
-   https://raw.githubusercontent.com/deten/webos-sonos-overlay/main/repo/
+   https://raw.githubusercontent.com/deten/webos-sonos-overlay/main/repo/apps.json
    ```
 
 3. Return to the app list. **Sonos Volume Overlay** appears there. Install it.
