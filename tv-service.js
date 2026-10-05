@@ -513,6 +513,10 @@ function summaryLines() {
   row('screen restarts', n('compositor_restarts'));
   row('  deferred',      n('restarts_deferred'),
       'held back because an app was in front');
+  row('  app put back',  n('restores'),
+      'app closed by a restart and launched again');
+  row('  not put back',  n('restore_skipped') + n('restore_failed'),
+      'viewer had moved on, or the launch failed');
   L.push('');
   row('events received', n('events'));
   row('event gaps',      n('event_gaps'),
@@ -601,16 +605,86 @@ function getForegroundApp(cb) {
     });
 }
 
-function restartCompositor(appId, reason) {
+// What a compositor restart does to what is on screen, measured on a TV:
+//   - An input (HDMI, live TV) is untouched. The TV puts itself back on the
+//     same input, after a brief input banner.
+//   - A streaming app is killed, and the TV falls back to the last input.
+// So inputs need nothing, and an app is launched again afterwards. It comes
+// back as the app, not at the same place in a show, which is the most that can
+// be done from outside it.
+//
+// opts.restore false skips this, used when the user has just pressed Finish in
+// setup and expects the screen to go away rather than something to relaunch.
+function restartCompositor(appId, reason, opts) {
+  opts = opts || {};
   state.overlayRestartTimer = null;
   state.overlayDeferredFor  = null;
-  detail('restarting the compositor to apply the volume patch (' + reason +
-         ', in front: ' + (appId || 'nothing') + ')');
-  bump('compositor_restarts');
-  cp.exec('systemctl restart surface-manager-daemon.service 2>/dev/null',
-    function (err) {
-      if (err) note('compositor restart failed: ' + err.message, 'error');
+
+  var canRestore = opts.restore !== false &&
+                   !(state.config && state.config.restoreAfterRestart === false);
+
+  function go(inFront) {
+    var toRestore = (canRestore && inFront && inFront !== APP_ID &&
+                     !isRestartSafe(inFront)) ? inFront : null;
+    detail('restarting the compositor to apply the volume patch (' + reason +
+           ', in front: ' + (inFront || 'nothing') +
+           (toRestore ? ', will be launched again afterwards' : '') + ')');
+    bump('compositor_restarts');
+    cp.exec('systemctl restart surface-manager-daemon.service 2>/dev/null',
+      function (err) {
+        if (err) { note('compositor restart failed: ' + err.message, 'error'); return; }
+        if (toRestore) restoreApp(toRestore);
+      });
+  }
+
+  // The deferred path already looked, and only gets here when it is safe.
+  if (appId !== null && appId !== undefined) { go(appId); return; }
+  if (!canRestore) { go(null); return; }
+  getForegroundApp(go);
+}
+
+// Launch the app that the restart closed, but only if the viewer has not gone
+// anywhere else in the meantime. After the restart the TV is on the home
+// screen or an input; if it is on a real app by now, that was the viewer's
+// choice and is left alone.
+function restoreApp(appId) {
+  var tries = 0;
+  setTimeout(function poll() {
+    getForegroundApp(function (inFront) {
+      tries++;
+      // Not answering yet while the app manager settles after the restart.
+      if (inFront === null && tries < 10) { setTimeout(poll, 1000); return; }
+
+      if (inFront && !isRestartSafe(inFront)) {
+        bump('restore_skipped');
+        detail('not relaunching ' + appId + ', ' + inFront + ' is already in front');
+        return;
+      }
+
+      var t0 = mono();
+      lunaCall('luna://com.webos.applicationManager/launch',
+               '{"id":"' + appId + '"}', function (ok) {
+        if (!ok) {
+          bump('restore_failed');
+          note('could not launch ' + appId + ' again after the screen restart', 'warn');
+          return;
+        }
+        // Report what happened rather than assuming it worked.
+        setTimeout(function () {
+          getForegroundApp(function (now) {
+            var back = now === appId;
+            bump(back ? 'restores' : 'restore_failed');
+            (back ? detail : note)(
+              (back ? 'put ' + appId + ' back in front'
+                    : 'asked for ' + appId + ' but ' + (now || 'nothing') +
+                      ' is in front') +
+              ', ' + Math.round((mono() - t0) / 100) / 10 + 's after asking',
+              back ? 'info' : 'warn');
+          });
+        }, 6000);
+      });
     });
+  }, 2000);
 }
 
 // The mount does nothing until the compositor restarts, and the restart tears
@@ -627,7 +701,7 @@ function scheduleCompositorRestart(reason, force) {
     clearTimeout(state.overlayRestartTimer);
     state.overlayRestartTimer = null;
   }
-  if (force) { restartCompositor(null, reason); return; }
+  if (force) { restartCompositor(null, reason, { restore: false }); return; }
 
   if (!(state.config && state.config.deferScreenRestart === true)) {
     restartCompositor(null, reason);

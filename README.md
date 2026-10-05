@@ -269,8 +269,11 @@ Written by the setup app to `/var/lib/com.brineandbuild.sonosoverlay/config.json
 | `maxVolume` | Absolute ceiling on the Sonos scale (default 70) |
 | `showOnScreenVolume` | Show the TV's volume number (default on). Off skips the patch and the screen restart at boot |
 | `deferScreenRestart` | Hold the boot screen restart until no app is open (default off). For TVs that resume an app at power on |
+| `restoreAfterRestart` | Launch an app again if the boot screen restart closed it (default on). It comes back as the app, not at the same place in a show. Set to `false` to turn off |
 
-Both settings can be changed on the last screen of the setup app.
+The first two can be changed on the last screen of the setup app. The restart
+closes streaming apps but not inputs, so this only matters when an app is open
+at that moment, and it is skipped if you have gone somewhere else meanwhile.
 
 ## Notes
 
