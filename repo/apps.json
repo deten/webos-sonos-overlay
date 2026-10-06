@@ -13,18 +13,18 @@
       "manifestUrl": "https://raw.githubusercontent.com/deten/webos-sonos-overlay/main/repo/webosbrew.manifest.json",
       "manifest": {
         "id": "com.brineandbuild.sonosoverlay",
-        "version": "0.10.0",
+        "version": "0.11.0",
         "type": "web",
         "title": "Sonos Volume Overlay",
         "appDescription": "Sonos volume sync and on-screen volume indicator for webOS LG TVs",
         "iconUri": "https://raw.githubusercontent.com/deten/webos-sonos-overlay/main/repo/icon.png",
         "sourceUrl": "https://github.com/deten/webos-sonos-overlay",
         "rootRequired": true,
-        "ipkUrl": "https://github.com/deten/webos-sonos-overlay/releases/download/v0.10.0/com.brineandbuild.sonosoverlay_0.10.0_all.ipk",
+        "ipkUrl": "https://github.com/deten/webos-sonos-overlay/releases/download/v0.11.0/com.brineandbuild.sonosoverlay_0.11.0_all.ipk",
         "ipkHash": {
-          "sha256": "f42af79e35abff9fa11e4bb4d57da0c1ba74b516bb257689ff9250eda1120ba6"
+          "sha256": "f4cb4155a458395704ac765667614905113808b8baf76c7df57e9f6bbcaa0153"
         },
-        "ipkSize": 146742
+        "ipkSize": 147652
       },
       "pool": "main",
       "shortDescription": "Keeps a Sonos soundbar in step with the TV volume and shows an on-screen indicator.",
