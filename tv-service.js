@@ -486,6 +486,8 @@ function summaryLines() {
       'the player had dropped our subscription');
   row('resub failures',  n('resub_failures'), 'event feed lost and rebuilt');
   L.push('');
+  row('boots not on ARC', n('output_not_arc_at_start'),
+      'first reading after boot was not the soundbar');
   row('output changes',  n('output_changes'),
       'TV sound moved on or off the soundbar');
   row('source changes',  n('source_changes'),
@@ -770,25 +772,40 @@ function applyOverlay(opts, cb) {
 // luna-send exits 0 even when the call it made failed, so the reply has to be
 // read rather than the exit code. On webOS 6 closeByAppId is the method that
 // works; plain close answers "no app matched by pid".
+// cb(ok, why): why is the TV's own explanation when the call failed, so a log
+// from another webOS version says what it refused and why.
 function lunaCall(uri, payload, cb) {
   cp.exec('/usr/bin/luna-send -n 1 -f ' + uri + ' \'' + payload + '\' 2>/dev/null',
     { timeout: 5000 }, function (err, stdout) {
-      if (err || !stdout) { cb(false); return; }
-      try { cb(JSON.parse(stdout).returnValue === true); }
-      catch (e) { cb(false); }
+      if (err || !stdout) { cb(false, err ? err.message.split('\n')[0] : 'no reply'); return; }
+      try {
+        var j = JSON.parse(stdout);
+        cb(j.returnValue === true, j.errorText || '');
+      } catch (e) { cb(false, 'unreadable reply'); }
     });
 }
 
+// Two methods are tried, and when neither closes it the home screen is
+// brought to the front instead, which gets the setup app out of the way. On
+// webOS 6.5 both close calls failed on a tester's TV, which left Finish stuck
+// on "Finishing..." with no way off the screen but the remote.
 function closeSetupApp() {
   var payload = '{"id":"' + APP_ID + '"}';
   lunaCall('luna://com.webos.applicationManager/closeByAppId', payload,
-    function (ok) {
+    function (ok, why) {
       if (ok) { detail('setup app closed'); return; }
       lunaCall('luna://com.webos.applicationManager/close', payload,
-        function (ok2) {
-          detail(ok2 ? 'setup app closed'
-                     : 'could not close the setup app from the service',
-                 ok2 ? 'info' : 'warn');
+        function (ok2, why2) {
+          if (ok2) { detail('setup app closed'); return; }
+          lunaCall('luna://com.webos.applicationManager/launch',
+                   '{"id":"com.webos.app.home"}', function (ok3, why3) {
+            bump('close_fallbacks');
+            note('could not close the setup app (closeByAppId: ' + (why || 'failed') +
+                 '; close: ' + (why2 || 'failed') + '), ' +
+                 (ok3 ? 'showed the home screen instead'
+                      : 'and the home screen would not open either (' + (why3 || 'failed') + ')'),
+                 'warn');
+          });
         });
     });
 }
@@ -1695,6 +1712,12 @@ function checkForMissedEvent(polledVol) {
   if (believed === null || polledVol === believed) return;
   if (newEvents > 0) return;   // it did tell us, we simply polled as well
 
+  // Our own write moves the player, and the event announcing it can arrive a
+  // moment after a poll that already sees the new value. A tester's log had
+  // one of these flagged 88ms after we wrote that very number.
+  if (state.lastWriteVal === polledVol && state.lastWriteAt &&
+      agoMs(state.lastWriteAt) < WRITE_ECHO_MS) return;
+
   bump('event_gaps');
 
   // A gap is proof the subscription is not delivering. On the development TV
@@ -1992,14 +2015,22 @@ function noteTvOutput(out) {
   if (!out || out === state.tvOutput) return;
   var prev = state.tvOutput;
   state.tvOutput = out;
+  // How long after power on matters here: a soundbar link that never came up
+  // at boot and one that dropped later point at different causes.
+  var at = tvUptimeSeconds();
+  var when = at === null ? '' : ' (' + at + 's after power on)';
   if (prev === null) {
-    detail('TV sound output: ' + out +
-           (out === 'external_arc' ? '' : ', not the soundbar'));
+    (out === 'external_arc' ? detail : note)(
+      'TV sound output at start: ' + out + when +
+      (out === 'external_arc' ? ''
+        : '. Sound is not going to the soundbar. The HDMI ARC link did not ' +
+          'come up at boot, or the TV is set to another output'),
+      out === 'external_arc' ? 'info' : 'warn');
     if (out !== 'external_arc') bump('output_not_arc_at_start');
     return;
   }
   bump('output_changes');
-  note('TV sound output changed: ' + prev + ' -> ' + out +
+  note('TV sound output changed: ' + prev + ' -> ' + out + when +
        (out === 'external_arc'
          ? ', back on the soundbar'
          : ', sound is no longer going to the soundbar') +
